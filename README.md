@@ -22,22 +22,16 @@ Python 3.12+ required.
 
 ### 1. Snapshot — capture a baseline
 
-Fetch an endpoint and store its schema in the local registry:
+Fetch an endpoint and store its schema in the local registry under an explicit name:
 
 ```bash
-python3 shelfard.py rest snapshot <url>
+python3 shelfard.py rest snapshot <url> --name <name>
 ```
 
 ```
-$ python3 shelfard.py rest snapshot https://api.example.com/users/1
+$ python3 shelfard.py rest snapshot https://api.example.com/users/1 --name users
 Fetching https://api.example.com/users/1 …
-✓ Snapshot saved: 'api_example_com_users_1' (version 1, 6 top-level columns)
-```
-
-The schema name is derived automatically from the URL. Override it with `--name`:
-
-```bash
-python3 shelfard.py rest snapshot https://api.example.com/users/1 --name users
+✓ Snapshot saved: 'users' (version 1, 6 top-level columns)
 ```
 
 ### 2. Check — detect drift
@@ -45,7 +39,7 @@ python3 shelfard.py rest snapshot https://api.example.com/users/1 --name users
 Fetch the endpoint again and compare against the saved snapshot:
 
 ```bash
-python3 shelfard.py rest check <url>
+python3 shelfard.py rest check <url> --name <name>
 ```
 
 **No drift:**
@@ -73,10 +67,10 @@ Fetching https://api.example.com/users/1 …
 
 ```bash
 # Bearer token
-python3 shelfard.py rest snapshot <url> --bearer <token>
+python3 shelfard.py rest snapshot <url> --name <name> --bearer <token>
 
 # Custom headers (repeatable)
-python3 shelfard.py rest snapshot <url> --header X-Api-Key=abc --header X-Tenant=acme
+python3 shelfard.py rest snapshot <url> --name <name> --header X-Api-Key=abc --header X-Tenant=acme
 ```
 
 ### Exit codes

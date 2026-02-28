@@ -3,16 +3,14 @@
 Shelfard — schema drift detection CLI.
 
 Usage:
-  shelfard rest snapshot <url> [--name NAME] [--bearer TOKEN] [--header KEY=VALUE ...]
-  shelfard rest check    <url> [--name NAME] [--bearer TOKEN] [--header KEY=VALUE ...]
+  shelfard rest snapshot <url> --name NAME [--bearer TOKEN] [--header KEY=VALUE ...]
+  shelfard rest check    <url> --name NAME [--bearer TOKEN] [--header KEY=VALUE ...]
   shelfard --help
 """
 
 import argparse
-import re
 import sys
 from pathlib import Path
-from urllib.parse import urlparse
 
 sys.path.insert(0, str(Path(__file__).parent))
 
@@ -39,18 +37,6 @@ def bold(t: str)   -> str: return _colour(t, "1")
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
-
-def _url_to_schema_name(url: str) -> str:
-    """Derive a stable, filesystem-safe schema name from a URL.
-
-    https://api.example.com/users/1  →  "api_example_com_users_1"
-    """
-    parsed = urlparse(url)
-    path = parsed.path.strip("/").replace("/", "_")
-    host = parsed.netloc.replace(".", "_").replace(":", "_")
-    raw = f"{host}_{path}" if path else host
-    return re.sub(r"[^a-z0-9_]", "_", raw.lower()).strip("_") or "schema"
-
 
 def _parse_headers(header_list: list[str]) -> dict[str, str]:
     """Parse ['Key=Value', ...] into a dict, warning on malformed entries."""
@@ -109,7 +95,7 @@ def _print_diff(schema_name: str, diff: dict, baseline_version: str) -> None:
 # ── REST commands ─────────────────────────────────────────────────────────────
 
 def cmd_rest_snapshot(args) -> int:
-    schema_name = args.name or _url_to_schema_name(args.url)
+    schema_name = args.name
     headers = _parse_headers(args.header)
 
     print(f"Fetching {args.url} …")
@@ -136,7 +122,7 @@ def cmd_rest_snapshot(args) -> int:
 
 
 def cmd_rest_check(args) -> int:
-    schema_name = args.name or _url_to_schema_name(args.url)
+    schema_name = args.name
     headers = _parse_headers(args.header)
 
     print(f"Fetching {args.url} …")
@@ -153,8 +139,7 @@ def cmd_rest_check(args) -> int:
     baseline_result = get_registered_schema(schema_name)
     if not baseline_result.success:
         print(red(f"✗ No snapshot found for '{schema_name}'."))
-        print(f"  Run:  shelfard rest snapshot {args.url}" +
-              (f" --name {schema_name}" if args.name else ""))
+        print(f"  Run:  shelfard rest snapshot {args.url} --name {args.name}")
         return 2
 
     diff_result = compare_schemas_from_dicts(
@@ -180,8 +165,8 @@ def _add_rest_subcommands(readers) -> None:
     rest_base = argparse.ArgumentParser(add_help=False)
     rest_base.add_argument("url", help="Endpoint URL to fetch")
     rest_base.add_argument(
-        "--name", metavar="NAME",
-        help="Schema name stored in the registry (default: derived from URL)",
+        "--name", metavar="NAME", required=True,
+        help="Schema name used to store and retrieve from the registry",
     )
     rest_base.add_argument(
         "--bearer", metavar="TOKEN",
