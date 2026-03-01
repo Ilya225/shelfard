@@ -18,6 +18,7 @@ from shelfard import (
     ColumnSchema, RestEndpointReader, TableSchema,
     compare_schemas_from_dicts, get_registered_schema, register_schema,
     get_all_schemas, get_all_consumers, subscribe_consumer,
+    RestCheckerConfig, register_checker, get_checker, get_all_checkers, run_checker,
 )
 from shelfard.models import ChangeSeverity
 
@@ -191,6 +192,12 @@ def cmd_show(args) -> int:
     print()
     print(bold(f"Schema: {args.table}") +
           f"  (source: {source} · version: {version} · {col_count} columns)")
+
+    checker_result = get_checker(args.table)
+    if checker_result.success:
+        c = checker_result.data["checker"]
+        print(f"Checker: {c['checker_type']}  (registered {c['registered_at']})")
+
     print()
     _print_schema(schema)
     print()
@@ -270,6 +277,96 @@ def cmd_subscribe(args) -> int:
     return 0
 
 
+# ── Checker commands ──────────────────────────────────────────────────────────
+
+def cmd_checker_register(args) -> int:
+    headers = []
+    for item in args.header or []:
+        if "=" not in item:
+            print(f"Warning: ignoring malformed --header {item!r} (expected KEY=VALUE)")
+            continue
+        k, _, v = item.partition("=")
+        headers.append({k.strip(): v.strip()})
+
+    config = RestCheckerConfig(
+        schema_name=args.schema_name,
+        url=args.url,
+        headers=headers,
+        env=args.env or [],
+    )
+    result = register_checker(args.schema_name, config)
+    if not result.success:
+        print(red(f"✗ {result.error}"))
+        return 2
+
+    env_count = len(config.env)
+    env_str = f"{env_count} env var{'s' if env_count != 1 else ''}"
+    print(green(f"✓ Checker registered for '{args.schema_name}'") +
+          f"  (rest · {env_str})")
+    return 0
+
+
+def cmd_checker_run(args) -> int:
+    checker_result = get_checker(args.schema_name)
+    if not checker_result.success:
+        print(red(f"✗ {checker_result.error}"))
+        return 2
+
+    url = checker_result.data["checker"]["url"]
+    print(f"Fetching {url} …")
+    result = run_checker(args.schema_name)
+    if not result.success:
+        print(red(f"✗ {result.error}"))
+        return 2
+
+    diff = result.data["diff"]
+    _print_diff(args.schema_name, diff, result.data["baseline_version"])
+    return 0 if not diff["changes"] else 1
+
+
+def cmd_checker_show(args) -> int:
+    result = get_checker(args.schema_name)
+    if not result.success:
+        print(red(f"✗ {result.error}"))
+        return 2
+
+    c = result.data["checker"]
+    print(f"\nChecker: {args.schema_name}")
+    print(f"  type:  {c['checker_type']}")
+    print(f"  url:   {c['url']}")
+    if c["env"]:
+        print(f"  env:   {', '.join(c['env'])}")
+    if c["headers"]:
+        print("  headers:")
+        for entry in c["headers"]:
+            for k, v in entry.items():
+                print(f"    {k}: {v}")
+    print()
+    return 0
+
+
+def cmd_checker_list(_args) -> int:
+    result = get_all_checkers()
+    if not result.success:
+        print(red(f"✗ {result.error}"))
+        return 2
+
+    checkers = result.data["checkers"]
+    if not checkers:
+        print("No checkers registered yet.")
+        return 0
+
+    print(f"\nCheckers ({len(checkers)}):\n")
+    for c in checkers:
+        env_str = ", ".join(c["env"]) if c["env"] else "—"
+        print(
+            f"  {c['schema_name']:<20} {c['checker_type']:<6} "
+            f"{c['url']:<45} {env_str:<20} {c['registered_at'] or ''}"
+        )
+    print()
+    return 0
+
+
 # ── Agent command ─────────────────────────────────────────────────────────────
 
 def cmd_agent(args) -> int:
@@ -321,6 +418,38 @@ def _add_rest_subcommands(top) -> None:
     chk.set_defaults(func=cmd_rest_check)
 
 
+def _add_checker_subcommands(top) -> None:
+    checker_p = top.add_parser("checker", help="Manage stored drift-check configurations")
+    checker_cmds = checker_p.add_subparsers(dest="command", required=True, metavar="COMMAND")
+
+    reg = checker_cmds.add_parser(
+        "register",
+        help="Register a checker config for a schema",
+    )
+    reg.add_argument("schema_name", help="Schema name to register a checker for")
+    reg.add_argument("--url", required=True, help="Endpoint URL (may contain $VAR placeholders)")
+    reg.add_argument(
+        "--header", metavar="KEY=VALUE", action="append", default=[],
+        help="Header to send; values may contain $VAR placeholders (repeatable)",
+    )
+    reg.add_argument(
+        "--env", metavar="VAR", action="append", default=[],
+        help="Env var name required at run time (repeatable)",
+    )
+    reg.set_defaults(func=cmd_checker_register)
+
+    run = checker_cmds.add_parser("run", help="Run the registered checker for a schema")
+    run.add_argument("schema_name", help="Schema name whose checker to run")
+    run.set_defaults(func=cmd_checker_run)
+
+    show = checker_cmds.add_parser("show", help="Display the registered checker config")
+    show.add_argument("schema_name", help="Schema name whose checker to show")
+    show.set_defaults(func=cmd_checker_show)
+
+    lst = checker_cmds.add_parser("list", help="List all registered checkers")
+    lst.set_defaults(func=cmd_checker_list)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="shelfard",
@@ -339,6 +468,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     _add_rest_subcommands(top)
+    _add_checker_subcommands(top)
     # Future: _add_sqlite_subcommands(top)
     # Future: _add_postgres_subcommands(top)
 

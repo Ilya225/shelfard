@@ -118,7 +118,7 @@ shelfard rest check --help
 
 ### Show a schema
 
-Display the full column layout of a registered schema, with type, nullability, and nested STRUCT fields:
+Display the full column layout of a registered schema, with type, nullability, and nested STRUCT fields. If a checker is registered for the schema, its type and registration time are shown:
 
 ```bash
 shelfard show <name>
@@ -128,6 +128,7 @@ shelfard show <name>
 $ shelfard show users
 
 Schema: users  (source: rest_api · version: 2026-02-28T12:00:00 · 5 columns)
+Checker: rest  (registered 2026-03-01T10:00:00)
 
   id                       INTEGER      NOT NULL
   email                    VARCHAR      NOT NULL   (max 255)
@@ -195,6 +196,74 @@ The subscription records a snapshot of the relevant columns at the time of the c
 
 ---
 
+## CLI — Checker (stored drift-check configs)
+
+Register a check configuration once, then run it any time — from the CLI, from code, or via the MCP server — without repeating the URL or auth details.
+
+### Register a checker
+
+```bash
+shelfard checker register <name> --url <url>
+```
+
+```
+$ shelfard checker register users --url https://api.example.com/users/1
+✓ Checker registered for 'users'  (rest · 0 env vars)
+```
+
+### Authentication via environment variables
+
+Env var names are stored in the config; their values are resolved from the environment at run time and never persisted:
+
+```bash
+shelfard checker register users \
+  --url 'https://api.example.com/users/1' \
+  --header 'Authorization=$BEARER_TOKEN' \
+  --env BEARER_TOKEN
+```
+
+### Run a checker
+
+```bash
+shelfard checker run <name>
+```
+
+```
+$ shelfard checker run users
+Fetching https://api.example.com/users/1 …
+✓ No drift detected for 'users'  (last snapshot: 2026-03-01T10:00:00)
+```
+
+Drift output follows the same format as `shelfard rest check`. Exit code `1` on drift makes this suitable for CI.
+
+### Show and list checkers
+
+```bash
+shelfard checker show <name>
+```
+
+```
+Checker: users
+  type:  rest
+  url:   https://api.example.com/users/1
+  env:   BEARER_TOKEN
+  headers:
+    Authorization: $BEARER_TOKEN
+```
+
+```bash
+shelfard checker list
+```
+
+```
+Checkers (2):
+
+  users    rest   https://api.example.com/users/1   BEARER_TOKEN   2026-03-01T...
+  posts    rest   https://api.example.com/posts/1   —              2026-03-01T...
+```
+
+---
+
 ## CLI — Interactive schema assistant
 
 Start a conversational agent that can query your schema registry. The model is auto-detected from your environment, or specified explicitly with `--model`.
@@ -245,7 +314,7 @@ Agent: The posts schema has 4 columns:
 You: exit
 ```
 
-The agent has access to four registry tools via the Shelfard MCP server: `get_schemas`, `get_schema`, `get_subscriptions`, `get_subscription`. It can answer questions, summarise schema shapes, and suggest next steps.
+The agent has access to all Shelfard MCP tools: `get_schemas`, `get_schema` (includes checker info), `get_subscriptions`, `get_subscription`, `register_checker`, `get_checker_config`, `live_check_schema`. It can answer questions, summarise schema shapes, register checkers, and run live drift checks.
 
 ---
 
@@ -259,14 +328,17 @@ Shelfard exposes its registry as a standalone **Model Context Protocol server**,
 shelfard mcp
 ```
 
-The server runs over **stdio** (the MCP standard for local tools). It exposes four tools:
+The server runs over **stdio** (the MCP standard for local tools). It exposes seven tools:
 
 | Tool | Description |
 |---|---|
 | `get_schemas` | List all registered schemas with summary info |
-| `get_schema(schema_name)` | Retrieve a specific schema with full column detail |
+| `get_schema(schema_name)` | Retrieve a specific schema with full column detail; includes checker info if registered |
 | `get_subscriptions` | List all consumer subscriptions |
 | `get_subscription(consumer_name, table_name)` | Retrieve a specific consumer subscription |
+| `register_checker(schema_name, url, env, headers)` | Register a REST checker config for a schema |
+| `get_checker_config(schema_name)` | Retrieve the stored checker config (url, env vars, headers) |
+| `live_check_schema(schema_name)` | Run the registered checker against the live endpoint and return the drift result |
 
 ### Claude Desktop
 

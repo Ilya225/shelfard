@@ -10,7 +10,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from typing import Optional
 
-from ..models import TableSchema, SchemaDiff, ToolResult
+from ..models import TableSchema, SchemaDiff, ToolResult, RestCheckerConfig
 
 
 class SchemaRegistry(ABC):
@@ -81,6 +81,41 @@ class SchemaRegistry(ABC):
         List every consumer subscription across all tables.
 
         Returns ToolResult with data={"consumers": [...]}.
+        """
+        ...
+
+    # ── Checkers ──────────────────────────────────────────────────────────────
+
+    @abstractmethod
+    def register_checker(self, schema_name: str, config: RestCheckerConfig) -> ToolResult:
+        """Store a checker config for the given schema."""
+        ...
+
+    @abstractmethod
+    def get_checker(self, schema_name: str) -> ToolResult:
+        """
+        Retrieve the checker config for the given schema.
+
+        Returns ToolResult with data={"checker": RestCheckerConfig.to_dict()}.
+        """
+        ...
+
+    @abstractmethod
+    def get_all_checkers(self) -> ToolResult:
+        """
+        List all registered checkers with summary metadata.
+
+        Returns ToolResult with data={"checkers": [...]}.
+        """
+        ...
+
+    @abstractmethod
+    def run_checker(self, schema_name: str) -> ToolResult:
+        """
+        Load the checker config for schema_name, instantiate the appropriate
+        Checker, and call run().
+
+        Returns the same ToolResult as Checker.run().
         """
         ...
 

@@ -33,6 +33,11 @@ __all__ = [
     "get_consumers_for_table",
     "get_all_consumers",
     "get_consumers_affected_by_diff",
+    # checker shims
+    "register_checker",
+    "get_checker",
+    "get_all_checkers",
+    "run_checker",
 ]
 
 # ── Default instance ──────────────────────────────────────────────────────────
@@ -48,3 +53,8 @@ get_consumer_subscription    = _default.get_consumer_subscription
 get_consumers_for_table      = _default.get_consumers_for_table
 get_all_consumers            = _default.get_all_consumers
 get_consumers_affected_by_diff = _default.get_consumers_affected_by_diff
+
+register_checker             = _default.register_checker
+get_checker                  = _default.get_checker
+get_all_checkers             = _default.get_all_checkers
+run_checker                  = _default.run_checker

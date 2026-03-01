@@ -15,7 +15,8 @@ Layered design — each layer is deterministic and agent-ready:
 - **Layer 1 — Acquisition** (`shelfard/readers/`): Vendor-specific readers extract raw schemas and normalize them to `TableSchema`; document parsers live in `shelfard/parsers/`
 - **Layer 1 — Registry** (`shelfard/registry/`): Pluggable registry with a `SchemaRegistry` ABC and a `LocalFileRegistry` implementation. Tracks both source schema versions and consumer subscriptions (full or projected). Stubs exist for S3, GCS, and SQL backends.
 - **Layer 2 — Comparison** (`shelfard/schema_comparison.py`): Pure deterministic diffing, produces self-documenting `SchemaDiff`
-- **Layer 3 — MCP Server** (`shelfard/mcp_server.py`): Standalone FastMCP server exposing four registry tools over stdio — `get_schema`, `get_schemas`, `get_subscriptions`, `get_subscription`. Any MCP client (Claude Desktop, Cursor, etc.) can connect directly.
+- **Layer 2 — Checkers** (`shelfard/checkers/`): Stored run configurations for drift checks. A `RestCheckerConfig` is registered once (URL, headers with `$VAR` placeholders, required env var names) and can then be run on demand. `RestChecker.run()` resolves env vars at call time, never at storage time.
+- **Layer 3 — MCP Server** (`shelfard/mcp_server.py`): Standalone FastMCP server exposing registry and checker tools over stdio — `get_schema` (includes checker info if registered), `get_schemas`, `get_subscriptions`, `get_subscription`, `register_checker`, `get_checker_config`, `live_check_schema`. Any MCP client (Claude Desktop, Cursor, etc.) can connect directly.
 - **Layer 3 — Agent** (`shelfard/agent.py`): Interactive LangChain 1.x assistant; spawns the MCP server as a subprocess via `MultiServerMCPClient` and gets its tools from there. Supports Claude and OpenAI; model resolved via `--model` flag or env-var auto-detection.
 - **Future layers** (planned): Autonomous remediation suggestions, background drift monitoring, consumer-aware alerting
 
@@ -29,10 +30,14 @@ All tools return `ToolResult` with: `success`, `data`, `error`, `next_action_hin
 |---|---|
 | `shelfard rest snapshot <url> --name NAME` | Fetch a REST endpoint and save its schema as a baseline |
 | `shelfard rest check <url> --name NAME` | Fetch and diff against the saved baseline; exit `1` on drift |
-| `shelfard show <table>` | Display a registered schema with column types, nullability, and STRUCT nesting |
+| `shelfard show <table>` | Display a registered schema; also shows checker type if one is registered |
 | `shelfard list schemas` | List all registered source schemas (name, columns, versions, source, latest version) |
 | `shelfard list subscriptions` | List all consumer subscriptions across all tables |
 | `shelfard subscribe <table> --consumer NAME [--columns COL1,COL2,...]` | Subscribe a consumer to a schema (full or projected) |
+| `shelfard checker register <name> --url URL [--header KEY=VALUE ...] [--env VAR ...]` | Register a stored drift-check config for a schema |
+| `shelfard checker run <name>` | Run the registered checker against the live endpoint; exit `1` on drift |
+| `shelfard checker show <name>` | Display the stored checker config (url, env vars, headers) |
+| `shelfard checker list` | List all registered checkers |
 | `shelfard agent [--model MODEL]` | Interactive schema assistant; spawns MCP server internally; auto-detects Claude or OpenAI from env |
 | `shelfard mcp` | Start the MCP server (stdio transport) — for use with Claude Desktop, Cursor, or any MCP client |
 
@@ -46,16 +51,20 @@ Exit codes: `0` = success / no drift, `1` = drift detected, `2` = error.
 Shelfard/
 ├── shelfard/                        # Python package — all source lives here
 │   ├── __init__.py               # Re-exports all public symbols
-│   ├── models.py                 # Core data structures: ColumnSchema, TableSchema, ConsumerSubscription, SchemaDiff, etc.
-│   ├── cli.py                    # CLI entry point — show, list, subscribe, rest snapshot/check, agent
+│   ├── models.py                 # Core data structures: ColumnSchema, TableSchema, ConsumerSubscription, SchemaDiff, RestCheckerConfig, etc.
+│   ├── cli.py                    # CLI entry point — show, list, subscribe, rest snapshot/check, checker, agent
 │   ├── registry/                 # Pluggable registry package
 │   │   ├── __init__.py           # Re-exports + _default LocalFileRegistry instance (backward-compat shims)
-│   │   ├── base.py               # SchemaRegistry ABC — 8 methods covering source schemas, consumer subscriptions, impact analysis
+│   │   ├── base.py               # SchemaRegistry ABC — 12 methods (source schemas, subscriptions, impact analysis, checkers)
 │   │   ├── local.py              # LocalFileRegistry(registry_dir=None) — file-based implementation
 │   │   ├── s3.py                 # S3Registry(bucket, prefix) — stub
 │   │   ├── gcs.py                # GCSRegistry(bucket, prefix) — stub
 │   │   └── sql.py                # SQLRegistry(connection_string) — stub
-│   ├── mcp_server.py             # FastMCP server — get_schema, get_schemas, get_subscriptions, get_subscription (stdio)
+│   ├── checkers/                 # Stored drift-check configurations
+│   │   ├── __init__.py           # Re-exports Checker, RestChecker
+│   │   ├── base.py               # Checker ABC — run() → ToolResult
+│   │   └── rest.py               # RestChecker — env var resolution, fetch via RestEndpointReader, diff
+│   ├── mcp_server.py             # FastMCP server — get_schema (+ checker info), get_schemas, get_subscriptions, get_subscription, register_checker, get_checker_config, live_check_schema (stdio)
 │   ├── agent.py                  # run_agent() async REPL — spawns MCP server via MultiServerMCPClient, supports Claude + OpenAI
 │   ├── schema_comparison.py      # Layer 2: Diff schemas, classify changes by severity
 │   ├── type_normalizer.py        # Vendor-agnostic utilities: TYPE_WIDENING_RULES, is_safe_widening, extract_length
@@ -87,7 +96,8 @@ Shelfard/
 ├── run_tests.py                  # 47 unit tests covering the full pipeline (no external test framework)
 ├── schemas/                      # File-based registry root (auto-created on first write)
 │   ├── sources/                  # Versioned source schema files — one JSON per table
-│   └── consumers/                # Consumer subscriptions — one JSON per consumer/table pair
+│   ├── consumers/                # Consumer subscriptions — one JSON per consumer/table pair
+│   └── checkers/                 # Checker configs — one JSON per schema (not versioned, always overwrites)
 └── CLAUDE.md
 ```
 
@@ -95,7 +105,7 @@ Importing: `from shelfard import ColumnSchema, get_sqlite_schema, compare_schema
 
 ### Adding a new registry backend
 1. Create `shelfard/registry/<backend>.py` with a class extending `SchemaRegistry`
-2. Implement all 8 abstract methods (source schemas, consumer subscriptions, impact analysis)
+2. Implement all 12 abstract methods (source schemas, consumer subscriptions, impact analysis, checkers)
 3. Re-export from `shelfard/registry/__init__.py` and `shelfard/__init__.py`
 
 ### Adding a new vendor reader
@@ -155,6 +165,7 @@ See `docs/test.md` for the full testing guide.
 - **`ColumnSchema`**: Column metadata — type, nullability, length, precision, default, description, and optionally `fields: list[ColumnSchema]` for `STRUCT` columns (recursive)
 - **`TableSchema`**: Full table — columns, partition keys, clustering keys, source tracking. The root-level schema is conceptually the top-level STRUCT.
 - **`ConsumerSubscription`**: A named consumer's dependency on a source schema. `subscribed_columns=None` means a full snapshot; a list means a projection. Stores the `TableSchema` snapshot at subscription time plus the source schema version it was derived from.
+- **`RestCheckerConfig`**: Stored configuration for a REST drift check — `schema_name`, `url`, `headers` (list of dicts, values may contain `$VAR` placeholders), `env` (list of required env var names, never values). Serialized as a single (non-versioned) JSON file at `schemas/checkers/<schema_name>.json`.
 - **`SchemaDiff`**: Comparison result — list of changes, severity per change, human-readable summaries. Nested STRUCT field changes use dot-notation column names (e.g. `"address.zip"`).
 
 ### STRUCT type
@@ -183,7 +194,8 @@ See `docs/test.md` for the full testing guide.
 - All public functions return `ToolResult` for LLM agent compatibility
 - Severity classification is deterministic — do not involve LLM for clear-cut cases
 - `SchemaRegistry` is an ABC — swap backends by instantiating a different class; module-level functions delegate to a `LocalFileRegistry` default instance
-- `LocalFileRegistry` storage: `schemas/sources/<table>.json` for source schemas, `schemas/consumers/<consumer>/<table>.json` for consumer subscriptions; both use versioned-list JSON format
+- `LocalFileRegistry` storage: `schemas/sources/<table>.json` (versioned list), `schemas/consumers/<consumer>/<table>.json` (versioned list), `schemas/checkers/<schema>.json` (single dict, always overwritten)
+- Checker env vars: resolved from `os.environ` at `RestChecker.run()` time; never stored as values. Use `$VAR_NAME` in url or header values; list the name in `env`.
 - `SchemaReader.get_schema()` takes no arguments — the target is fixed in the constructor
 - Unit tests live in `run_tests.py`; integration tests (requiring network mocks or external resources) live in `tests/`; both use a custom minimal test runner (no pytest)
 - Registry test isolation: patch `registry._default._root = Path(tmp)` inside a `tempfile.TemporaryDirectory()` block

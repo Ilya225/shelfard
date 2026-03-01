@@ -208,6 +208,38 @@ class SchemaDiff:
 
 
 # ─────────────────────────────────────────────
+# Checker config
+# ─────────────────────────────────────────────
+
+@dataclass
+class RestCheckerConfig:
+    """Stored configuration for a REST-based drift check."""
+    schema_name: str
+    url: str
+    headers: list[dict[str, str]]   # e.g. [{"Authorization": "$BEARER_TOKEN"}]
+    env: list[str]                  # e.g. ["BEARER_TOKEN"] — names only, never values
+    checker_type: str = "rest"
+    registered_at: Optional[str] = None
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+    def to_json(self) -> str:
+        return json.dumps(self.to_dict(), indent=2, default=str)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "RestCheckerConfig":
+        return cls(
+            schema_name=d["schema_name"],
+            url=d["url"],
+            headers=d.get("headers", []),
+            env=d.get("env", []),
+            checker_type=d.get("checker_type", "rest"),
+            registered_at=d.get("registered_at"),
+        )
+
+
+# ─────────────────────────────────────────────
 # Tool result wrapper
 # ─────────────────────────────────────────────
 

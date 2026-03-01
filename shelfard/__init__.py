@@ -1,7 +1,7 @@
 from .models import (
     ColumnSchema, TableSchema, ColumnType,
     ChangeSeverity, ChangeType, SchemaDiff, ColumnChange, ToolResult,
-    ConsumerSubscription,
+    ConsumerSubscription, RestCheckerConfig,
 )
 from .readers import get_sqlite_schema, list_sqlite_tables, RestEndpointReader, get_rest_schema
 from .parsers import get_schema_from_json, infer_schema_from_json_file, read_and_register_json_file
@@ -11,5 +11,7 @@ from .registry import (
     subscribe_consumer, get_consumer_subscription,
     get_consumers_for_table, get_all_consumers,
     get_consumers_affected_by_diff,
+    register_checker, get_checker, get_all_checkers, run_checker,
 )
+from .checkers import Checker, RestChecker
 from .schema_comparison import compare_schemas, compare_schemas_from_dicts

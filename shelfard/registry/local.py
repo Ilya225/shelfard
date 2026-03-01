@@ -19,7 +19,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-from ..models import ColumnSchema, TableSchema, ConsumerSubscription, SchemaDiff, ToolResult
+from ..models import ColumnSchema, TableSchema, ConsumerSubscription, SchemaDiff, ToolResult, RestCheckerConfig
 from .base import SchemaRegistry
 
 
@@ -312,6 +312,70 @@ class LocalFileRegistry(SchemaRegistry):
                     pass
 
         return ToolResult(success=True, data={"consumers": consumers})
+
+    # ── Checkers ──────────────────────────────────────────────────────────────
+
+    def _checkers_dir(self) -> Path:
+        return self._root / "checkers"
+
+    def _checker_path(self, schema_name: str) -> Path:
+        return self._checkers_dir() / f"{schema_name}.json"
+
+    def register_checker(self, schema_name: str, config: RestCheckerConfig) -> ToolResult:
+        """Store a checker config. Always overwrites — checkers are not versioned."""
+        config.registered_at = datetime.utcnow().isoformat()
+        path = self._checker_path(schema_name)
+        try:
+            self._save_json(path, config.to_dict())
+            return ToolResult(
+                success=True,
+                data={"schema_name": schema_name, "registered_at": config.registered_at},
+            )
+        except Exception as e:
+            return ToolResult(success=False, error=f"Failed to register checker: {e}")
+
+    def get_checker(self, schema_name: str) -> ToolResult:
+        """Retrieve the checker config for the given schema."""
+        path = self._checker_path(schema_name)
+        if not path.exists():
+            return ToolResult(
+                success=False,
+                error=f"No checker registered for '{schema_name}'.",
+            )
+        try:
+            config = RestCheckerConfig.from_dict(self._load_json(path))
+            return ToolResult(success=True, data={"checker": config.to_dict()})
+        except Exception as e:
+            return ToolResult(success=False, error=f"Failed to read checker: {e}")
+
+    def get_all_checkers(self) -> ToolResult:
+        """List all registered checkers with summary metadata."""
+        checkers_dir = self._checkers_dir()
+        if not checkers_dir.exists():
+            return ToolResult(success=True, data={"checkers": []})
+        result = []
+        for f in sorted(checkers_dir.glob("*.json")):
+            try:
+                c = self._load_json(f)
+                result.append({
+                    "schema_name": c["schema_name"],
+                    "checker_type": c.get("checker_type", "rest"),
+                    "url": c.get("url", ""),
+                    "env": c.get("env", []),
+                    "registered_at": c.get("registered_at"),
+                })
+            except Exception:
+                pass
+        return ToolResult(success=True, data={"checkers": result})
+
+    def run_checker(self, schema_name: str) -> ToolResult:
+        """Load the checker config and run the live drift check."""
+        result = self.get_checker(schema_name)
+        if not result.success:
+            return result
+        from ..checkers.rest import RestChecker
+        config = RestCheckerConfig.from_dict(result.data["checker"])
+        return RestChecker(config, self).run()
 
     # ── Impact analysis ───────────────────────────────────────────────────────
 
