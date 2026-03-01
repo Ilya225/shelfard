@@ -151,6 +151,14 @@ def cmd_rest_check(args) -> int:
     return 0 if not diff["changes"] else 1
 
 
+# ── Agent command ─────────────────────────────────────────────────────────────
+
+def cmd_agent(_args) -> int:
+    from shelfard.agent import run_agent
+    run_agent()
+    return 0
+
+
 # ── Parser ────────────────────────────────────────────────────────────────────
 
 def _add_rest_subcommands(readers) -> None:
@@ -206,6 +214,12 @@ def build_parser() -> argparse.ArgumentParser:
     _add_rest_subcommands(readers)
     # Future: _add_sqlite_subcommands(readers)
     # Future: _add_postgres_subcommands(readers)
+
+    agent_p = readers.add_parser(
+        "agent",
+        help="Start an interactive schema assistant powered by Claude",
+    )
+    agent_p.set_defaults(func=cmd_agent)
 
     return parser
 

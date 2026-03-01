@@ -15,7 +15,8 @@ Layered design — each layer is deterministic and agent-ready:
 - **Layer 1 — Acquisition** (`shelfard/readers/`): Vendor-specific readers extract raw schemas and normalize them to `TableSchema`; document parsers live in `shelfard/parsers/`
 - **Layer 1 — Registry** (`shelfard/registry.py`): Stores and retrieves versioned `TableSchema` baselines
 - **Layer 2 — Comparison** (`shelfard/schema_comparison.py`): Pure deterministic diffing, produces self-documenting `SchemaDiff`
-- **Future layers** (planned): LLM reasoning for ambiguous cases, remediation suggestions, pipeline impact analysis
+- **Layer 3 — Agent** (`shelfard/agent.py`): Interactive Claude-powered assistant; wraps registry tools as Anthropic tool-use definitions
+- **Future layers** (planned): Autonomous remediation suggestions, pipeline impact analysis, background drift monitoring
 
 All tools return `ToolResult` with: `success`, `data`, `error`, `next_action_hint`.
 
@@ -28,7 +29,8 @@ Shelfard/
 ├── shelfard/                        # Python package — all source lives here
 │   ├── __init__.py               # Re-exports all public symbols
 │   ├── models.py                 # Core data structures: ColumnSchema, TableSchema, SchemaDiff, etc.
-│   ├── registry.py               # register_schema, get_registered_schema, REGISTRY_DIR
+│   ├── registry.py               # register_schema, get_registered_schema, get_all_schemas, REGISTRY_DIR
+│   ├── agent.py                  # run_agent() REPL — TOOLS definitions, _execute_tool, SYSTEM_PROMPT
 │   ├── schema_comparison.py      # Layer 2: Diff schemas, classify changes by severity
 │   ├── type_normalizer.py        # Vendor-agnostic utilities: TYPE_WIDENING_RULES, is_safe_widening, extract_length
 │   ├── readers/                  # Live source readers — each vendor is its own package
@@ -52,7 +54,7 @@ Shelfard/
 └── CLAUDE.md
 ```
 
-Importing: `from shelfard import ColumnSchema, get_sqlite_schema, compare_schemas, ...`
+Importing: `from shelfard import ColumnSchema, get_sqlite_schema, compare_schemas, get_all_schemas, ...`
 
 ### Adding a new vendor reader
 1. Create `shelfard/readers/<vendor>/` package with `_TYPE_MAP`, `_normalize_type()`, and a class implementing `SchemaReader`
@@ -77,7 +79,7 @@ Each vendor's raw-type-to-`ColumnType` mapping lives exclusively in its own read
 ## Tech Stack
 
 - **Language**: Python 3.12 (conda env: `shelfard`)
-- **Dependencies**: `requests` (REST reader); all other code is stdlib. Declared in `pyproject.toml`.
+- **Dependencies**: `requests` (REST reader), `anthropic` (agent); all other code is stdlib. Declared in `pyproject.toml`.
 - **Supported sources**: SQLite, REST API endpoints; PostgreSQL, Snowflake, BigQuery (type maps only, readers pending)
 
 ### Running tests

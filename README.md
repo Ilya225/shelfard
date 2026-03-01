@@ -107,6 +107,37 @@ shelfard rest check --help
 
 ---
 
+## CLI — Interactive schema assistant
+
+Start a conversational agent that can query your schema registry using Claude:
+
+```bash
+export ANTHROPIC_API_KEY=<your-key>
+shelfard agent
+```
+
+```
+Shelfard Agent  (type 'exit' to quit)
+
+You: what schemas do I have?
+Agent: You have 2 schemas stored:
+  • posts — 4 columns, rest_api (saved 2026-03-01T09:38:23)
+  • todos — 4 columns, rest_api (saved 2026-02-28T21:46:13)
+
+You: show me the posts schema
+Agent: The posts schema has 4 columns:
+  • userId   INTEGER  not null
+  • id       INTEGER  not null
+  • title    VARCHAR  not null
+  • body     VARCHAR  not null
+
+You: exit
+```
+
+The agent has access to two registry tools: listing all schemas and reading a specific one. It can answer questions, summarise schema shapes, and suggest next steps.
+
+---
+
 ## How it works
 
 1. **Snapshot** — fetches the endpoint, infers a typed schema from the JSON response (nested objects become `STRUCT` columns), and saves it to a local file-based registry under `schemas/`.

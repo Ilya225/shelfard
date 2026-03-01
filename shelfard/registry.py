@@ -80,6 +80,36 @@ def get_registered_schema(table_name: str, version: str = "latest") -> ToolResul
         return ToolResult(success=False, error=f"Failed to read registry: {e}")
 
 
+def get_all_schemas() -> ToolResult:
+    """
+    List all schemas stored in the registry with summary metadata.
+
+    Returns each entry's name, version count, latest version timestamp,
+    source, and column count.
+    """
+    if not REGISTRY_DIR.exists():
+        return ToolResult(success=True, data={"schemas": []})
+
+    schemas = []
+    for path in sorted(REGISTRY_DIR.glob("*.json")):
+        try:
+            with open(path) as f:
+                data = json.load(f)
+            versions = data.get("versions", [])
+            latest = versions[-1] if versions else None
+            schemas.append({
+                "name": data.get("table_name", path.stem),
+                "version_count": len(versions),
+                "latest_version": latest["captured_at"] if latest else None,
+                "source": latest.get("source", "unknown") if latest else None,
+                "column_count": len(latest.get("columns", [])) if latest else 0,
+            })
+        except Exception:
+            pass
+
+    return ToolResult(success=True, data={"schemas": schemas})
+
+
 def register_schema(table_name: str, schema: TableSchema) -> ToolResult:
     """
     Saves a schema to the registry as a new version.
