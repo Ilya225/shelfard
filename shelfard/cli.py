@@ -278,6 +278,14 @@ def cmd_agent(args) -> int:
     return 0
 
 
+# ── MCP server command ────────────────────────────────────────────────────────
+
+def cmd_mcp(_args) -> int:
+    from shelfard.mcp_server import run
+    run()
+    return 0
+
+
 # ── Parser ────────────────────────────────────────────────────────────────────
 
 def _add_rest_subcommands(top) -> None:
@@ -347,6 +355,12 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     agent_p.set_defaults(func=cmd_agent)
+
+    mcp_p = top.add_parser(
+        "mcp",
+        help="Start the Shelfard MCP server (stdio transport)",
+    )
+    mcp_p.set_defaults(func=cmd_mcp)
 
     show_p = top.add_parser("show", help="Display a registered schema")
     show_p.add_argument("table", help="Schema name to display")
