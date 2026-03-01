@@ -31,6 +31,13 @@ Python 3.12+ required.
 
 ---
 
+### if you just cloned the repo locally
+
+```bash
+conda activate shelfard
+```
+
+
 ## CLI — REST endpoint drift detection
 
 ### 1. Snapshot — capture a baseline
