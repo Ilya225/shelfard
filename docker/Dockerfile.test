@@ -1,0 +1,23 @@
+# Dockerfile.test — CLI smoke test image
+#
+# Each `docker run` is a clean, reproducible test:
+#   - fresh pip install of shelfard from source
+#   - all CLI commands exercised against JSONPlaceholder
+#   - non-zero exit on any failure
+#
+# Build:
+#   docker build -f docker/Dockerfile.test -t shelfard-test .
+#
+# Run:
+#   docker run --rm shelfard-test
+
+FROM continuumio/miniconda3
+
+# Install Python 3.12 into the base conda env
+RUN conda install -y -c conda-forge python=3.12 && conda clean -afy
+
+# Copy source (install happens at runtime so every `docker run` is fresh)
+WORKDIR /shelfard
+COPY . .
+
+ENTRYPOINT ["bash", "docker/test.sh"]

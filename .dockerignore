@@ -1,0 +1,7 @@
+schemas/
+shelfard.egg-info/
+__pycache__/
+*.pyc
+*.pyo
+.git/
+.DS_Store
