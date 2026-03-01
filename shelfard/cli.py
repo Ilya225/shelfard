@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Shelfard — schema drift detection CLI.
 
@@ -10,15 +9,12 @@ Usage:
 
 import argparse
 import sys
-from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).parent))
-
-from tools import (
+from shelfard import (
     ColumnSchema, RestEndpointReader, TableSchema,
     compare_schemas_from_dicts, get_registered_schema, register_schema,
 )
-from tools.models import ChangeSeverity
+from shelfard.models import ChangeSeverity
 
 
 # ── ANSI colours ──────────────────────────────────────────────────────────────

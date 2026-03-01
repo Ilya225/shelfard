@@ -8,10 +8,23 @@ Capture the shape of a data source once, then re-check it any time to surface un
 
 ## Install
 
+### pip
+
 ```bash
-git clone git@github.com:Ilya225/shelfard.git
-cd shelfard
-pip install -r requirements.txt
+pip install git+https://github.com/Ilya225/shelfard.git
+```
+
+Or, once published to PyPI:
+
+```bash
+pip install shelfard
+```
+
+### Homebrew
+
+```bash
+brew tap Ilya225/shelfard
+brew install shelfard
 ```
 
 Python 3.12+ required.
@@ -25,11 +38,11 @@ Python 3.12+ required.
 Fetch an endpoint and store its schema in the local registry under an explicit name:
 
 ```bash
-python3 shelfard.py rest snapshot <url> --name <name>
+shelfard rest snapshot <url> --name <name>
 ```
 
 ```
-$ python3 shelfard.py rest snapshot https://api.example.com/users/1 --name users
+$ shelfard rest snapshot https://api.example.com/users/1 --name users
 Fetching https://api.example.com/users/1 …
 ✓ Snapshot saved: 'users' (version 1, 6 top-level columns)
 ```
@@ -39,19 +52,19 @@ Fetching https://api.example.com/users/1 …
 Fetch the endpoint again and compare against the saved snapshot:
 
 ```bash
-python3 shelfard.py rest check <url> --name <name>
+shelfard rest check <url> --name <name>
 ```
 
 **No drift:**
 ```
-$ python3 shelfard.py rest check https://api.example.com/users/1 --name users
+$ shelfard rest check https://api.example.com/users/1 --name users
 Fetching https://api.example.com/users/1 …
 ✓ No drift detected for 'users'  (last snapshot: 2026-02-28T12:00:00)
 ```
 
 **Drift detected:**
 ```
-$ python3 shelfard.py rest check https://api.example.com/users/1 --name users
+$ shelfard rest check https://api.example.com/users/1 --name users
 Fetching https://api.example.com/users/1 …
 ✗ Schema drift detected for 'users'
   2 change(s): 1 breaking, 1 safe.
@@ -67,10 +80,10 @@ Fetching https://api.example.com/users/1 …
 
 ```bash
 # Bearer token
-python3 shelfard.py rest snapshot <url> --name <name> --bearer <token>
+shelfard rest snapshot <url> --name <name> --bearer <token>
 
 # Custom headers (repeatable)
-python3 shelfard.py rest snapshot <url> --name <name> --header X-Api-Key=abc --header X-Tenant=acme
+shelfard rest snapshot <url> --name <name> --header X-Api-Key=abc --header X-Tenant=acme
 ```
 
 ### Exit codes
@@ -86,10 +99,10 @@ Exit code `1` on drift makes `check` suitable for use in CI pipelines.
 ### Help
 
 ```bash
-python3 shelfard.py --help
-python3 shelfard.py rest --help
-python3 shelfard.py rest snapshot --help
-python3 shelfard.py rest check --help
+shelfard --help
+shelfard rest --help
+shelfard rest snapshot --help
+shelfard rest check --help
 ```
 
 ---

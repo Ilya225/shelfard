@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "shelfard"
+version = "0.1.0"
+description = "Schema drift detection for REST APIs and databases"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.12"
+dependencies = ["requests>=2.28"]
+
+[project.urls]
+Homepage = "https://github.com/Ilya225/shelfard"
+Repository = "https://github.com/Ilya225/shelfard"
+
+[project.scripts]
+shelfard = "shelfard.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["shelfard*"]

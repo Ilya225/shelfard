@@ -19,7 +19,7 @@ from pathlib import Path
 # Make the project root importable
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from tools import ColumnType, RestEndpointReader, get_rest_schema
+from shelfard import ColumnType, RestEndpointReader, get_rest_schema
 
 # ─────────────────────────────────────────────
 # Minimal test framework (mirrors run_tests.py)

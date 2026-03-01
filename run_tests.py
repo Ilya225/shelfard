@@ -14,13 +14,13 @@ from pathlib import Path
 # Make tools importable
 sys.path.insert(0, str(Path(__file__).parent))
 
-from tools import (
+from shelfard import (
     ColumnSchema, TableSchema, ColumnType, ChangeSeverity, ChangeType,
     get_sqlite_schema, register_schema, get_registered_schema,
     compare_schemas, compare_schemas_from_dicts, get_schema_from_json,
     infer_schema_from_json_file, read_and_register_json_file,
 )
-import tools.registry as registry
+import shelfard.registry as registry
 
 # ─────────────────────────────────────────────
 # Minimal test framework

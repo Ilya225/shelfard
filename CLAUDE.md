@@ -12,9 +12,9 @@ It is designed as **Day 1 of a multi-phase LLM agent** for autonomous schema man
 
 Layered design — each layer is deterministic and agent-ready:
 
-- **Layer 1 — Acquisition** (`tools/readers/`): Vendor-specific readers extract raw schemas and normalize them to `TableSchema`; document parsers live in `tools/parsers/`
-- **Layer 1 — Registry** (`tools/registry.py`): Stores and retrieves versioned `TableSchema` baselines
-- **Layer 2 — Comparison** (`tools/schema_comparison.py`): Pure deterministic diffing, produces self-documenting `SchemaDiff`
+- **Layer 1 — Acquisition** (`shelfard/readers/`): Vendor-specific readers extract raw schemas and normalize them to `TableSchema`; document parsers live in `shelfard/parsers/`
+- **Layer 1 — Registry** (`shelfard/registry.py`): Stores and retrieves versioned `TableSchema` baselines
+- **Layer 2 — Comparison** (`shelfard/schema_comparison.py`): Pure deterministic diffing, produces self-documenting `SchemaDiff`
 - **Future layers** (planned): LLM reasoning for ambiguous cases, remediation suggestions, pipeline impact analysis
 
 All tools return `ToolResult` with: `success`, `data`, `error`, `next_action_hint`.
@@ -25,7 +25,7 @@ All tools return `ToolResult` with: `success`, `data`, `error`, `next_action_hin
 
 ```
 Shelfard/
-├── tools/                        # Python package — all source lives here
+├── shelfard/                        # Python package — all source lives here
 │   ├── __init__.py               # Re-exports all public symbols
 │   ├── models.py                 # Core data structures: ColumnSchema, TableSchema, SchemaDiff, etc.
 │   ├── registry.py               # register_schema, get_registered_schema, REGISTRY_DIR
@@ -45,23 +45,24 @@ Shelfard/
 │       └── json_file_reader.py   # infer_schema_from_json_file, read_and_register_json_file
 ├── tests/
 │   └── test_rest_reader.py       # 7 REST integration tests (mock HTTP server, no real network)
+├── pyproject.toml                # Packaging metadata and entry point (shelfard = "shelfard.cli:main")
+├── Formula/shelfard.rb           # Homebrew formula (copy to homebrew-shelfard tap repo to publish)
 ├── run_tests.py                  # 41 unit tests covering the full pipeline (no external test framework)
-├── requirements.txt              # External dependencies (requests)
 ├── schemas/                      # File-based schema registry (auto-created on first register_schema() call)
 └── CLAUDE.md
 ```
 
-Importing: `from tools import ColumnSchema, get_sqlite_schema, compare_schemas, ...`
+Importing: `from shelfard import ColumnSchema, get_sqlite_schema, compare_schemas, ...`
 
 ### Adding a new vendor reader
-1. Create `tools/readers/<vendor>/` package with `_TYPE_MAP`, `_normalize_type()`, and a class implementing `SchemaReader`
+1. Create `shelfard/readers/<vendor>/` package with `_TYPE_MAP`, `_normalize_type()`, and a class implementing `SchemaReader`
 2. `get_schema(self)` takes **no arguments** — the target (table name, endpoint URL, etc.) is stored in `__init__`
 3. Add module-level wrapper functions (`get_<vendor>_schema`, `list_<vendor>_tables`) in the package `__init__.py`
-4. Re-export from `tools/readers/__init__.py` and `tools/__init__.py`
+4. Re-export from `shelfard/readers/__init__.py` and `shelfard/__init__.py`
 
 ### Adding a new parser
-1. Create `tools/parsers/<format>_reader.py` (does NOT implement `SchemaReader` — parsers are document-based, not live sources)
-2. Re-export from `tools/parsers/__init__.py` and `tools/__init__.py`
+1. Create `shelfard/parsers/<format>_reader.py` (does NOT implement `SchemaReader` — parsers are document-based, not live sources)
+2. Re-export from `shelfard/parsers/__init__.py` and `shelfard/__init__.py`
 
 ### type_normalizer.py responsibilities
 Contains only vendor-agnostic logic — nothing in this file knows about raw SQL type strings:
@@ -76,7 +77,7 @@ Each vendor's raw-type-to-`ColumnType` mapping lives exclusively in its own read
 ## Tech Stack
 
 - **Language**: Python 3.12 (conda env: `shelfard`)
-- **Dependencies**: `requests` (REST reader); all other code is stdlib. See `requirements.txt`.
+- **Dependencies**: `requests` (REST reader); all other code is stdlib. Declared in `pyproject.toml`.
 - **Supported sources**: SQLite, REST API endpoints; PostgreSQL, Snowflake, BigQuery (type maps only, readers pending)
 
 ### Running tests
@@ -119,7 +120,7 @@ conda run -n shelfard python3 tests/test_rest_reader.py
 
 ## Key Conventions
 
-- External dependencies must be justified and listed in `requirements.txt`; prefer stdlib otherwise
+- External dependencies must be justified and declared in `pyproject.toml` `dependencies`; prefer stdlib otherwise
 - All public functions return `ToolResult` for LLM agent compatibility
 - Severity classification is deterministic — do not involve LLM for clear-cut cases
 - Schema registry uses file-based storage with version timestamps
