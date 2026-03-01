@@ -105,6 +105,46 @@ class TableSchema:
         return json.dumps(self.to_dict(), indent=2, default=str)
 
 
+@dataclass
+class ConsumerSubscription:
+    """
+    Records that a named consumer depends on (a projection of) a source schema.
+
+    subscribed_columns=None means the consumer subscribed to the full schema.
+    subscribed_columns=[...] means the consumer only reads those columns (projection).
+    schema holds the TableSchema snapshot at subscription time (projected or full).
+    """
+    consumer_name: str
+    source_table: str
+    subscribed_columns: Optional[list[str]]   # None = full subscription
+    schema: TableSchema                        # projected or full snapshot
+    subscribed_at: str                         # ISO timestamp
+    source_schema_version: str                 # captured_at of source at subscription time
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> ConsumerSubscription:
+        schema_d = d["schema"]
+        schema = TableSchema(
+            table_name=schema_d["table_name"],
+            columns=[ColumnSchema.from_dict(c) for c in schema_d["columns"]],
+            partition_keys=schema_d.get("partition_keys", []),
+            clustering_keys=schema_d.get("clustering_keys", []),
+            source=schema_d.get("source", "registry"),
+            captured_at=schema_d.get("captured_at"),
+        )
+        return cls(
+            consumer_name=d["consumer_name"],
+            source_table=d["source_table"],
+            subscribed_columns=d.get("subscribed_columns"),
+            schema=schema,
+            subscribed_at=d["subscribed_at"],
+            source_schema_version=d["source_schema_version"],
+        )
+
+
 # ─────────────────────────────────────────────
 # Diff models
 # ─────────────────────────────────────────────

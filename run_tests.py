@@ -16,10 +16,15 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from shelfard import (
     ColumnSchema, TableSchema, ColumnType, ChangeSeverity, ChangeType,
+    ConsumerSubscription, LocalFileRegistry,
     get_sqlite_schema, register_schema, get_registered_schema,
     compare_schemas, compare_schemas_from_dicts, get_schema_from_json,
     infer_schema_from_json_file, read_and_register_json_file,
+    subscribe_consumer, get_consumer_subscription,
+    get_consumers_for_table, get_consumers_affected_by_diff,
 )
+from shelfard.schema_comparison import compare_schemas as _compare_schemas_raw
+from shelfard.models import SchemaDiff, ColumnChange
 import shelfard.registry as registry
 
 # ─────────────────────────────────────────────
@@ -141,7 +146,7 @@ def make_orders_v1():
 
 def test_register_and_retrieve():
     with tempfile.TemporaryDirectory() as tmp:
-        registry.REGISTRY_DIR = Path(tmp)
+        registry._default._root = Path(tmp)
         schema = make_orders_v1()
         reg = register_schema("orders", schema)
         assert reg.success
@@ -154,7 +159,7 @@ test("register and retrieve schema", test_register_and_retrieve)
 
 def test_unregistered_table():
     with tempfile.TemporaryDirectory() as tmp:
-        registry.REGISTRY_DIR = Path(tmp)
+        registry._default._root = Path(tmp)
         result = get_registered_schema("nonexistent")
         assert not result.success
         assert result.next_action_hint is not None
@@ -163,7 +168,7 @@ test("unregistered table returns helpful error", test_unregistered_table)
 
 def test_multiple_versions():
     with tempfile.TemporaryDirectory() as tmp:
-        registry.REGISTRY_DIR = Path(tmp)
+        registry._default._root = Path(tmp)
         v1 = make_orders_v1()
         register_schema("orders", v1)
         v2 = TableSchema(
@@ -408,7 +413,7 @@ section("End-to-End: SQLite → Registry → Compare")
 
 def test_full_pipeline():
     with tempfile.TemporaryDirectory() as tmp:
-        registry.REGISTRY_DIR = Path(tmp)
+        registry._default._root = Path(tmp)
         db = f"{tmp}/events.db"
 
         # Create v1
@@ -572,9 +577,7 @@ test("file not found → ToolResult(success=False)", test_file_not_found)
 
 def test_read_and_register():
     with tempfile.TemporaryDirectory() as tmp:
-        registry_dir = Path(tmp) / "registry"
-        registry_dir.mkdir()
-        registry.REGISTRY_DIR = registry_dir
+        registry._default._root = Path(tmp)
         path = f"{tmp}/api_response.json"
         with open(path, "w") as f:
             json.dump({
@@ -654,9 +657,7 @@ test("mixed types inside STRUCT fields inferred correctly", test_struct_field_ty
 
 def test_struct_roundtrip():
     with tempfile.TemporaryDirectory() as tmp:
-        registry_dir = Path(tmp) / "registry"
-        registry_dir.mkdir()
-        registry.REGISTRY_DIR = registry_dir
+        registry._default._root = Path(tmp)
         path = f"{tmp}/event.json"
         with open(path, "w") as f:
             json.dump({"payload": {"event_type": "click", "value": 1}}, f)
@@ -744,6 +745,131 @@ def test_qualified_names_in_nested_diff():
     assert diff["changes"][0]["severity"] == ChangeSeverity.BREAKING
 
 test("3-level nested drift uses fully qualified name 'user.address.zip'", test_qualified_names_in_nested_diff)
+
+
+section("Consumer Subscriptions")
+
+def _make_users_schema():
+    return TableSchema(
+        table_name="users",
+        columns=[
+            ColumnSchema("id",         ColumnType.INTEGER,   nullable=False),
+            ColumnSchema("email",      ColumnType.VARCHAR,   nullable=False),
+            ColumnSchema("name",       ColumnType.TEXT,      nullable=True),
+            ColumnSchema("created_at", ColumnType.TIMESTAMP, nullable=False),
+        ],
+        source="test",
+    )
+
+def test_subscribe_consumer_full():
+    with tempfile.TemporaryDirectory() as tmp:
+        r = LocalFileRegistry(tmp)
+        r.register_schema("users", _make_users_schema())
+        result = r.subscribe_consumer("analytics", "users")
+        assert result.success, result.error
+        assert result.data["column_count"] == 4
+        assert result.data["subscribed_columns"] is None
+
+test("full subscription snapshots all columns", test_subscribe_consumer_full)
+
+def test_subscribe_consumer_projection():
+    with tempfile.TemporaryDirectory() as tmp:
+        r = LocalFileRegistry(tmp)
+        r.register_schema("users", _make_users_schema())
+        result = r.subscribe_consumer("reporting", "users", columns=["email", "created_at"])
+        assert result.success, result.error
+        assert result.data["column_count"] == 2
+        assert result.data["subscribed_columns"] == ["email", "created_at"]
+
+        sub_result = r.get_consumer_subscription("reporting", "users")
+        assert sub_result.success
+        sub = sub_result.data["subscription"]
+        assert len(sub["schema"]["columns"]) == 2
+        col_names = [c["name"] for c in sub["schema"]["columns"]]
+        assert "email" in col_names
+        assert "created_at" in col_names
+
+test("projection subscription captures only requested columns", test_subscribe_consumer_projection)
+
+def test_subscribe_consumer_unknown_source():
+    with tempfile.TemporaryDirectory() as tmp:
+        r = LocalFileRegistry(tmp)
+        result = r.subscribe_consumer("analytics", "nonexistent")
+        assert not result.success
+        assert "nonexistent" in result.error.lower() or "not registered" in result.error.lower()
+
+test("subscribe to unregistered source → helpful error", test_subscribe_consumer_unknown_source)
+
+def test_get_consumers_for_table():
+    with tempfile.TemporaryDirectory() as tmp:
+        r = LocalFileRegistry(tmp)
+        r.register_schema("users", _make_users_schema())
+        r.subscribe_consumer("analytics",  "users")
+        r.subscribe_consumer("reporting",  "users", columns=["email"])
+        result = r.get_consumers_for_table("users")
+        assert result.success
+        consumers = {c["consumer"]: c for c in result.data["consumers"]}
+        assert "analytics" in consumers
+        assert "reporting" in consumers
+        assert consumers["analytics"]["subscribed_columns"] is None
+        assert consumers["reporting"]["subscribed_columns"] == ["email"]
+
+test("get_consumers_for_table lists all subscribers", test_get_consumers_for_table)
+
+def test_get_consumers_affected_full_subscription():
+    from shelfard.models import SchemaDiff, ColumnChange, ChangeType, ChangeSeverity
+    with tempfile.TemporaryDirectory() as tmp:
+        r = LocalFileRegistry(tmp)
+        r.register_schema("users", _make_users_schema())
+        r.subscribe_consumer("analytics", "users")  # full subscription
+
+        diff = SchemaDiff(
+            table_name="users",
+            old_schema_version="v1",
+            new_schema_version="v2",
+            changes=[ColumnChange(
+                change_type=ChangeType.COLUMN_REMOVED,
+                column_name="name",
+                severity=ChangeSeverity.BREAKING,
+                reasoning="Column removed",
+            )],
+            overall_severity=ChangeSeverity.BREAKING,
+        )
+        result = r.get_consumers_affected_by_diff("users", diff)
+        assert result.success
+        affected = {a["consumer"]: a for a in result.data["affected"]}
+        assert "analytics" in affected
+        assert len(affected["analytics"]["impacted_changes"]) == 1
+
+test("full subscriber is always affected by any change", test_get_consumers_affected_full_subscription)
+
+def test_get_consumers_affected_projection():
+    from shelfard.models import SchemaDiff, ColumnChange, ChangeType, ChangeSeverity
+    with tempfile.TemporaryDirectory() as tmp:
+        r = LocalFileRegistry(tmp)
+        r.register_schema("users", _make_users_schema())
+        r.subscribe_consumer("email_svc", "users", columns=["email"])
+        r.subscribe_consumer("name_svc",  "users", columns=["name"])
+
+        diff = SchemaDiff(
+            table_name="users",
+            old_schema_version="v1",
+            new_schema_version="v2",
+            changes=[ColumnChange(
+                change_type=ChangeType.COLUMN_REMOVED,
+                column_name="name",
+                severity=ChangeSeverity.BREAKING,
+                reasoning="Column removed",
+            )],
+            overall_severity=ChangeSeverity.BREAKING,
+        )
+        result = r.get_consumers_affected_by_diff("users", diff)
+        assert result.success
+        affected = {a["consumer"]: a for a in result.data["affected"]}
+        assert "name_svc" in affected          # subscribed to 'name' — affected
+        assert "email_svc" not in affected     # subscribed to 'email' only — not affected
+
+test("projection subscriber only affected when their columns change", test_get_consumers_affected_projection)
 
 
 # ─────────────────────────────────────────────

@@ -4,6 +4,10 @@ Shelfard — schema drift detection CLI.
 Usage:
   shelfard rest snapshot <url> --name NAME [--bearer TOKEN] [--header KEY=VALUE ...]
   shelfard rest check    <url> --name NAME [--bearer TOKEN] [--header KEY=VALUE ...]
+  shelfard show          <table>
+  shelfard list          {schemas,subscriptions}
+  shelfard subscribe     <table> --consumer NAME [--columns COL1,COL2,...]
+  shelfard agent
   shelfard --help
 """
 
@@ -13,6 +17,7 @@ import sys
 from shelfard import (
     ColumnSchema, RestEndpointReader, TableSchema,
     compare_schemas_from_dicts, get_registered_schema, register_schema,
+    get_all_schemas, get_all_consumers, subscribe_consumer,
 )
 from shelfard.models import ChangeSeverity
 
@@ -88,6 +93,25 @@ def _print_diff(schema_name: str, diff: dict, baseline_version: str) -> None:
         print()
 
 
+def _print_schema(schema_dict: dict, indent: int = 0) -> None:
+    """Print columns recursively, indenting nested STRUCT fields."""
+    pad = "  " * indent
+    for col in schema_dict["columns"]:
+        prefix = "." if indent > 0 else ""
+        name = f"{pad}{prefix}{col['name']}"
+        col_type = col["col_type"].upper()
+        nullable = "nullable" if col["nullable"] else "NOT NULL"
+        notes = []
+        if col.get("max_length"):
+            notes.append(f"max {col['max_length']}")
+        if col.get("precision"):
+            notes.append(f"precision {col['precision']},{col.get('scale', 0)}")
+        note_str = f"   ({', '.join(notes)})" if notes else ""
+        print(f"  {name:<24} {col_type:<12} {nullable}{note_str}")
+        if col.get("fields"):
+            _print_schema({"columns": col["fields"]}, indent + 1)
+
+
 # ── REST commands ─────────────────────────────────────────────────────────────
 
 def cmd_rest_snapshot(args) -> int:
@@ -151,6 +175,101 @@ def cmd_rest_check(args) -> int:
     return 0 if not diff["changes"] else 1
 
 
+# ── show command ──────────────────────────────────────────────────────────────
+
+def cmd_show(args) -> int:
+    result = get_registered_schema(args.table)
+    if not result.success:
+        print(red(f"✗ {result.error}"))
+        return 2
+
+    schema = result.data["schema"]
+    version = result.data["version"]
+    col_count = len(schema["columns"])
+    source = schema.get("source", "unknown")
+
+    print()
+    print(bold(f"Schema: {args.table}") +
+          f"  (source: {source} · version: {version} · {col_count} columns)")
+    print()
+    _print_schema(schema)
+    print()
+    return 0
+
+
+# ── list command ──────────────────────────────────────────────────────────────
+
+def cmd_list(args) -> int:
+    if args.what == "schemas":
+        result = get_all_schemas()
+        if not result.success:
+            print(red(f"✗ {result.error}"))
+            return 2
+
+        schemas = result.data["schemas"]
+        if not schemas:
+            print("No schemas registered yet.")
+            return 0
+
+        print(f"\nSchemas ({len(schemas)}):\n")
+        for s in schemas:
+            ver_word = "version" if s["version_count"] == 1 else "versions"
+            print(
+                f"  {s['name']:<20} {s['column_count']} cols   "
+                f"{s['version_count']} {ver_word:<10} "
+                f"{s.get('source') or 'unknown':<14} {s['latest_version']}"
+            )
+        print()
+
+    else:  # subscriptions
+        result = get_all_consumers()
+        if not result.success:
+            print(red(f"✗ {result.error}"))
+            return 2
+
+        consumers = result.data["consumers"]
+        if not consumers:
+            print("No subscriptions registered yet.")
+            return 0
+
+        print(f"\nConsumer subscriptions ({len(consumers)}):\n")
+        for c in consumers:
+            cols = c.get("subscribed_columns")
+            cols_str = ", ".join(cols) if cols else "all columns"
+            print(
+                f"  {c['consumer']:<20} {c['source_table']:<14} "
+                f"{cols_str:<30} {c['subscribed_at']}"
+            )
+        print()
+
+    return 0
+
+
+# ── subscribe command ─────────────────────────────────────────────────────────
+
+def cmd_subscribe(args) -> int:
+    columns = None
+    if args.columns:
+        columns = [c.strip() for c in args.columns.split(",") if c.strip()]
+
+    result = subscribe_consumer(args.consumer, args.table, columns)
+    if not result.success:
+        print(red(f"✗ {result.error}"))
+        return 2
+
+    col_count = result.data["column_count"]
+    if columns:
+        cols_display = ", ".join(columns)
+        print(green(f"✓ Subscribed '{args.consumer}' to '{args.table}' — {col_count} columns: {cols_display}"))
+    else:
+        print(green(f"✓ Subscribed '{args.consumer}' to '{args.table}' — all {col_count} columns captured."))
+
+    if result.next_action_hint:
+        print(f"  Note: {result.next_action_hint}")
+
+    return 0
+
+
 # ── Agent command ─────────────────────────────────────────────────────────────
 
 def cmd_agent(_args) -> int:
@@ -161,8 +280,8 @@ def cmd_agent(_args) -> int:
 
 # ── Parser ────────────────────────────────────────────────────────────────────
 
-def _add_rest_subcommands(readers) -> None:
-    rest_p = readers.add_parser("rest", help="REST API endpoint reader")
+def _add_rest_subcommands(top) -> None:
+    rest_p = top.add_parser("rest", help="REST API endpoint reader")
     rest_cmds = rest_p.add_subparsers(dest="command", required=True, metavar="COMMAND")
 
     # Shared options for all REST commands
@@ -205,21 +324,45 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
 
-    readers = parser.add_subparsers(
-        dest="reader", required=True,
-        metavar="READER",
-        help="Data source type",
+    top = parser.add_subparsers(
+        dest="command", required=True,
+        metavar="COMMAND",
+        help="Command to run",
     )
 
-    _add_rest_subcommands(readers)
-    # Future: _add_sqlite_subcommands(readers)
-    # Future: _add_postgres_subcommands(readers)
+    _add_rest_subcommands(top)
+    # Future: _add_sqlite_subcommands(top)
+    # Future: _add_postgres_subcommands(top)
 
-    agent_p = readers.add_parser(
+    agent_p = top.add_parser(
         "agent",
         help="Start an interactive schema assistant powered by Claude",
     )
     agent_p.set_defaults(func=cmd_agent)
+
+    show_p = top.add_parser("show", help="Display a registered schema")
+    show_p.add_argument("table", help="Schema name to display")
+    show_p.set_defaults(func=cmd_show)
+
+    list_p = top.add_parser("list", help="List registered schemas or consumer subscriptions")
+    list_p.add_argument(
+        "what",
+        choices=["schemas", "subscriptions"],
+        help="What to list",
+    )
+    list_p.set_defaults(func=cmd_list)
+
+    sub_p = top.add_parser("subscribe", help="Subscribe a consumer to a registered schema")
+    sub_p.add_argument("table", help="Source schema name")
+    sub_p.add_argument(
+        "--consumer", metavar="NAME", required=True,
+        help="Consumer name",
+    )
+    sub_p.add_argument(
+        "--columns", metavar="COL1,COL2,...",
+        help="Comma-separated columns to subscribe to (default: all columns)",
+    )
+    sub_p.set_defaults(func=cmd_subscribe)
 
     return parser
 

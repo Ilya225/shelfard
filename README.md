@@ -107,6 +107,87 @@ shelfard rest check --help
 
 ---
 
+## CLI — Inspect the registry
+
+### Show a schema
+
+Display the full column layout of a registered schema, with type, nullability, and nested STRUCT fields:
+
+```bash
+shelfard show <name>
+```
+
+```
+$ shelfard show users
+
+Schema: users  (source: rest_api · version: 2026-02-28T12:00:00 · 5 columns)
+
+  id                       INTEGER      NOT NULL
+  email                    VARCHAR      NOT NULL   (max 255)
+  name                     TEXT         nullable
+  address                  STRUCT       nullable
+    .street                VARCHAR      nullable
+    .city                  VARCHAR      nullable
+  created_at               TIMESTAMP    NOT NULL
+```
+
+### List schemas
+
+```bash
+shelfard list schemas
+```
+
+```
+Schemas (2):
+
+  orders               5 cols   1 version    test           2026-02-28T18:00:00
+  users                5 cols   2 versions   rest_api       2026-02-28T12:00:00
+```
+
+### List consumer subscriptions
+
+```bash
+shelfard list subscriptions
+```
+
+```
+Consumer subscriptions (3):
+
+  analytics            users          all columns                    2026-02-28T12:00:00
+  email_svc            users          email, created_at              2026-02-28T14:00:00
+  reporting            orders         all columns                    2026-02-28T16:00:00
+```
+
+---
+
+## CLI — Consumer subscriptions
+
+Register which schemas (and columns) a consumer depends on directly from the terminal.
+
+### Full subscription
+
+```bash
+shelfard subscribe users --consumer analytics
+```
+
+```
+✓ Subscribed 'analytics' to 'users' — all 5 columns captured.
+```
+
+### Projection
+
+```bash
+shelfard subscribe users --consumer email_svc --columns email,created_at
+```
+
+```
+✓ Subscribed 'email_svc' to 'users' — 2 columns: email, created_at
+```
+
+The subscription records a snapshot of the relevant columns at the time of the command. Run `shelfard list subscriptions` to see all registered consumers.
+
+---
+
 ## CLI — Interactive schema assistant
 
 Start a conversational agent that can query your schema registry using Claude:
@@ -140,7 +221,7 @@ The agent has access to two registry tools: listing all schemas and reading a sp
 
 ## How it works
 
-1. **Snapshot** — fetches the endpoint, infers a typed schema from the JSON response (nested objects become `STRUCT` columns), and saves it to a local file-based registry under `schemas/`.
+1. **Snapshot** — fetches the endpoint, infers a typed schema from the JSON response (nested objects become `STRUCT` columns), and saves it to the registry under `schemas/sources/`.
 2. **Check** — fetches the endpoint again, diffs the new schema against the saved baseline using deterministic rules, and classifies every change as `SAFE`, `WARNING`, or `BREAKING`.
 
 Change classification is fully deterministic — no LLM involved for clear-cut cases:
@@ -150,6 +231,59 @@ Change classification is fully deterministic — no LLM involved for clear-cut c
 | `SAFE` | Nullable column added, type widened (`int` → `bigint`, `varchar(50)` → `varchar(200)`) |
 | `WARNING` | Column reordered, default value changed |
 | `BREAKING` | Column removed, type narrowed, `NOT NULL` column added without a default |
+
+---
+
+## Consumer subscriptions (Python API)
+
+Register consumers and the columns they depend on. When a source schema drifts, Shelfard tells you exactly which consumers are impacted.
+
+```python
+from shelfard import LocalFileRegistry
+
+r = LocalFileRegistry()
+
+# Full subscription — consumer depends on the entire schema
+r.subscribe_consumer("reporting_service", "users")
+
+# Projection — consumer only reads these two columns
+r.subscribe_consumer("email_service", "users", columns=["email", "created_at"])
+
+# After detecting drift, find out who is affected
+from shelfard import compare_schemas, get_registered_schema
+from shelfard.models import SchemaDiff
+
+diff_result = compare_schemas(old_schema, new_schema)
+diff = SchemaDiff(**diff_result.data["diff"])  # reconstruct from dict if needed
+
+impact = r.get_consumers_affected_by_diff("users", diff)
+for entry in impact.data["affected"]:
+    print(entry["consumer"], "→", [c["column_name"] for c in entry["impacted_changes"]])
+```
+
+Consumer snapshots are stored under `schemas/consumers/<consumer>/<table>.json` and versioned the same way as source schemas.
+
+---
+
+## Pluggable registry backends
+
+The default backend stores schemas as local JSON files. Swap it out by instantiating a different `SchemaRegistry` implementation:
+
+```python
+from shelfard import LocalFileRegistry
+from shelfard.registry import S3Registry, GCSRegistry, SQLRegistry  # stubs — coming soon
+
+# Default: local filesystem
+r = LocalFileRegistry()                          # defaults to ./schemas/
+r = LocalFileRegistry("/data/shelfard")          # custom path
+
+# Planned backends (raise NotImplementedError until implemented)
+r = S3Registry("my-bucket", prefix="shelfard/")
+r = GCSRegistry("my-bucket")
+r = SQLRegistry("postgresql://user:pass@host/db")
+```
+
+All backends share the same interface (`SchemaRegistry` ABC), so switching is a one-line change.
 
 ---
 
