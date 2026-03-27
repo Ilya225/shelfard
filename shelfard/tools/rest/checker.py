@@ -22,10 +22,17 @@ class RestChecker(Checker):
                 error=f"Missing required env vars: {', '.join(missing)}",
             )
 
+        # 1.5 — Resolve {{template_vars}} from registry (before $ENV_VAR substitution)
+        url_template = self.registry.resolve_template(self.config.url)
+        headers_templates = [
+            {k: self.registry.resolve_template(v) for k, v in entry.items()}
+            for entry in self.config.headers
+        ]
+
         # 2. Resolve $VAR substitutions in URL and header values
-        url = _substitute(self.config.url, self.config.env)
+        url = _substitute(url_template, self.config.env)
         resolved_headers: dict[str, str] = {}
-        for entry in self.config.headers:
+        for entry in headers_templates:
             for k, v in entry.items():
                 resolved_headers[k] = _substitute(v, self.config.env)
 

@@ -17,5 +17,6 @@ from .registry import (
     get_consumers_for_table, get_all_consumers,
     get_consumers_affected_by_diff,
     register_checker, get_checker, get_all_checkers, run_checker,
+    set_var, get_var, list_vars, delete_var,
 )
 from .schema_comparison import compare_schemas, compare_schemas_from_dicts

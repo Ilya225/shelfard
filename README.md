@@ -57,6 +57,19 @@ Fetching https://api.example.com/users/1 …
 ✓ Snapshot saved: 'users' (version 1, 6 top-level columns)
 ```
 
+Add `--create-checker` to register a checker config in the same command — no separate `checker register` step needed. `$VAR_NAME` references in the URL and headers are extracted automatically into the `env` list:
+
+```bash
+shelfard rest snapshot https://api.example.com/users/1 --name users \
+  --header 'Authorization=Bearer $BEARER_TOKEN' \
+  --create-checker
+```
+
+```
+✓ Snapshot saved: 'users' (version 1, 6 top-level columns)
+✓ Checker registered for 'users'  (rest · 1 env var)
+```
+
 ### 2. Check — detect drift
 
 Fetch the endpoint again and compare against the saved snapshot:
@@ -138,6 +151,21 @@ shelfard postgres check    --dsn "postgresql://user:pass@host/db" --table orders
 ```
 Reading PostgreSQL 'orders' …
 ✓ Snapshot saved: 'orders' (version 1, 7 top-level columns)
+```
+
+Add `--create-checker` to register a checker in the same step. `$VAR_NAME` references in the DSN are extracted automatically:
+
+```bash
+shelfard postgres snapshot \
+  --dsn 'postgresql://user:$PG_PASS@host/db' \
+  --table orders --name orders \
+  --create-checker
+```
+
+```
+Reading PostgreSQL 'orders' …
+✓ Snapshot saved: 'orders' (version 1, 7 top-level columns)
+✓ Checker registered for 'orders'  (postgres · 1 env var)
 ```
 
 ### Custom SQL query mode
@@ -265,6 +293,8 @@ The subscription records a snapshot of the relevant columns at the time of the c
 
 Register a check configuration once, then run it any time — from the CLI, from code, or via the MCP server — without repeating the URL, DSN, or auth details. Two checker types are supported: `rest` (default) and `postgres`.
 
+The easiest way is `--create-checker` on a snapshot command (see above) — it builds the checker from the same arguments automatically. Use `checker register` when you need to register or update a checker independently.
+
 ### REST checker
 
 ```bash
@@ -346,6 +376,59 @@ Checkers (3):
 
 ---
 
+## CLI — Template variables
+
+Store repeated non-sensitive config values (hosts, base URLs, ports) once and reference them as `{{var_name}}` in checker configs and snapshot commands. This is distinct from `$ENV_VAR` — template variables are stored in the registry and are not secrets.
+
+### Set and use a variable
+
+```bash
+shelfard var set todo_host http://localhost:8080
+```
+
+```
+✓ Set {{ todo_host }} = 'http://localhost:8080'
+```
+
+Now use it anywhere a URL or DSN would appear:
+
+```bash
+# Snapshot only
+shelfard rest snapshot "{{todo_host}}/api/v1" --name todo_api
+
+# Snapshot + checker in one step (--create-checker extracts $VAR refs automatically)
+shelfard rest snapshot "{{todo_host}}/api/v1" --name todo_api --create-checker
+shelfard postgres snapshot --dsn "postgresql://user:pass@{{db_host}}/mydb" --table orders --name orders --create-checker
+```
+
+Template variables are resolved **before** `$ENV_VAR` substitution, so they can be combined:
+
+```bash
+shelfard var set api_base https://api.example.com
+shelfard rest snapshot "{{api_base}}/users/1" --name users \
+  --header "Authorization=$BEARER_TOKEN" \
+  --create-checker
+```
+
+### Manage variables
+
+```bash
+shelfard var get todo_host          # Show a single variable's value
+shelfard var list                   # List all stored variables
+shelfard var unset todo_host        # Delete a variable
+```
+
+```
+Template variables (2):
+
+  {{ api_base               }}  =  'https://api.example.com'
+  {{ db_host                }}  =  'localhost'
+```
+
+Variables are stored in `schemas/vars.json` in plain text — do not use them for secrets.
+
+---
+
 ## CLI — Interactive schema assistant
 
 Start a conversational agent that can query your schema registry. The model is auto-detected from your environment, or specified explicitly with `--model`.
@@ -396,7 +479,7 @@ Agent: The posts schema has 4 columns:
 You: exit
 ```
 
-The agent has access to all Shelfard MCP tools: `get_schemas`, `get_schema` (includes checker info), `get_subscriptions`, `get_subscription`, `register_checker`, `get_checker_config`, `live_check_schema`. It can answer questions, summarise schema shapes, register checkers, and run live drift checks.
+The agent has access to all Shelfard MCP tools: `get_schemas`, `get_schema` (includes checker info), `get_subscriptions`, `get_subscription`, `register_checker`, `get_checker_config`, `live_check_schema`, `set_template_var`, `get_template_var`, `list_template_vars`, `delete_template_var`. It can answer questions, summarise schema shapes, register checkers, manage template variables, and run live drift checks.
 
 ---
 
@@ -410,7 +493,7 @@ Shelfard exposes its registry as a standalone **Model Context Protocol server**,
 shelfard mcp
 ```
 
-The server runs over **stdio** (the MCP standard for local tools). It exposes seven tools:
+The server runs over **stdio** (the MCP standard for local tools). It exposes eleven tools:
 
 | Tool | Description |
 |---|---|
@@ -421,6 +504,10 @@ The server runs over **stdio** (the MCP standard for local tools). It exposes se
 | `register_checker(schema_name, url, env, headers)` | Register a REST checker config for a schema |
 | `get_checker_config(schema_name)` | Retrieve the stored checker config (url, env vars, headers) |
 | `live_check_schema(schema_name)` | Run the registered checker against the live endpoint and return the drift result |
+| `set_template_var(name, value)` | Store a named template variable for use as `{{name}}` in checker configs and snapshot commands |
+| `get_template_var(name)` | Retrieve a stored template variable by name |
+| `list_template_vars()` | List all stored template variables and their values |
+| `delete_template_var(name)` | Delete a stored template variable by name |
 
 ### Claude Desktop
 

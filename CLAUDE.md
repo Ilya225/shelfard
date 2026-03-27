@@ -15,8 +15,9 @@ Layered design — each layer is deterministic and agent-ready:
 - **Layer 1 — Acquisition** (`shelfard/tools/`): Vendor-specific tools co-locate the reader and checker for each data source. Each vendor package (e.g. `tools/rest/`, `tools/postgres/`) contains a `reader.py` (implements `SchemaReader` ABC) and a `checker.py` (implements `Checker` ABC). Shared SQL utilities live in `tools/sql/base.py`. Document parsers live in `shelfard/parsers/`.
 - **Layer 1 — Registry** (`shelfard/registry/`): Pluggable registry with a `SchemaRegistry` ABC and a `LocalFileRegistry` implementation. Tracks both source schema versions and consumer subscriptions (full or projected). Stubs exist for S3, GCS, and SQL backends.
 - **Layer 2 — Comparison** (`shelfard/schema_comparison.py`): Pure deterministic diffing, produces self-documenting `SchemaDiff`
-- **Layer 2 — Checkers** (`shelfard/tools/*/checker.py`): Stored run configurations for drift checks. Two checker types are supported: `RestCheckerConfig` (URL + headers with `$VAR` placeholders) and `PostgresCheckerConfig` (DSN with `$VAR` placeholders + table or custom SQL query). Env var values are resolved from `os.environ` at `Checker.run()` time, never at storage time. `LocalFileRegistry.run_checker()` dispatches to the correct `Checker` subclass via the stored `checker_type` field.
-- **Layer 3 — MCP Server** (`shelfard/mcp_server.py`): Standalone FastMCP server exposing registry and checker tools over stdio — `get_schema` (includes checker info if registered), `get_schemas`, `get_subscriptions`, `get_subscription`, `register_checker`, `get_checker_config`, `live_check_schema`. Any MCP client (Claude Desktop, Cursor, etc.) can connect directly.
+- **Layer 2 — Checkers** (`shelfard/tools/*/checker.py`): Stored run configurations for drift checks. Two checker types are supported: `RestCheckerConfig` (URL + headers with `$VAR` placeholders and/or `{{var}}` template vars) and `PostgresCheckerConfig` (DSN with `$VAR` placeholders and/or `{{var}}` template vars + table or custom SQL query). Resolution order at `Checker.run()` time: `{{template_vars}}` from registry first, then `$ENV_VARS` from `os.environ`. `LocalFileRegistry.run_checker()` dispatches to the correct `Checker` subclass via the stored `checker_type` field.
+- **Layer 2 — Template Variables** (`shelfard/registry/`): Persistent key-value store for non-sensitive config values (hosts, base URLs, ports). Stored in `schemas/vars.json`. Referenced as `{{var_name}}` in checker configs and snapshot CLI commands. Managed via `shelfard var set/get/list/unset` or the MCP tools `set_template_var`, `get_template_var`, `list_template_vars`, `delete_template_var`. Distinct from `$ENV_VAR` (secrets, not stored).
+- **Layer 3 — MCP Server** (`shelfard/mcp_server.py`): Standalone FastMCP server exposing registry and checker tools over stdio — `get_schema` (includes checker info if registered), `get_schemas`, `get_subscriptions`, `get_subscription`, `register_checker`, `get_checker_config`, `live_check_schema`, `set_template_var`, `get_template_var`, `list_template_vars`, `delete_template_var`. Any MCP client (Claude Desktop, Cursor, etc.) can connect directly.
 - **Layer 3 — Agent** (`shelfard/agent.py`): Interactive LangChain 1.x assistant; spawns the MCP server as a subprocess via `MultiServerMCPClient` and gets its tools from there. Supports Claude and OpenAI; model resolved via `--model` flag or env-var auto-detection.
 - **Future layers** (planned): Autonomous remediation suggestions, background drift monitoring, consumer-aware alerting
 
@@ -28,9 +29,9 @@ All tools return `ToolResult` with: `success`, `data`, `error`, `next_action_hin
 
 | Command | Description |
 |---|---|
-| `shelfard rest snapshot <url> --name NAME` | Fetch a REST endpoint and save its schema as a baseline |
+| `shelfard rest snapshot <url> --name NAME [--create-checker]` | Fetch a REST endpoint and save its schema as a baseline; `--create-checker` also registers a checker from the same URL/headers (auto-extracts `$VAR` refs into `env`) |
 | `shelfard rest check <url> --name NAME` | Fetch and diff against the saved baseline; exit `1` on drift |
-| `shelfard postgres snapshot --dsn DSN --name NAME [--table TABLE \| --query SQL]` | Read a PostgreSQL table or query result and save its schema as a baseline |
+| `shelfard postgres snapshot --dsn DSN --name NAME [--table TABLE \| --query SQL] [--create-checker]` | Read a PostgreSQL table or query result and save its schema as a baseline; `--create-checker` also registers a checker from the same DSN/table/query (auto-extracts `$VAR` refs into `env`) |
 | `shelfard postgres check --dsn DSN --name NAME [--table TABLE \| --query SQL]` | Read and diff against the saved baseline; exit `1` on drift |
 | `shelfard show <table>` | Display a registered schema; also shows checker type if one is registered |
 | `shelfard list schemas` | List all registered source schemas (name, columns, versions, source, latest version) |
@@ -41,6 +42,10 @@ All tools return `ToolResult` with: `success`, `data`, `error`, `next_action_hin
 | `shelfard checker run <name>` | Run the registered checker (REST or PostgreSQL); exit `1` on drift |
 | `shelfard checker show <name>` | Display the stored checker config (type-aware: url/headers for REST, dsn/table/query for PostgreSQL) |
 | `shelfard checker list` | List all registered checkers |
+| `shelfard var set <name> <value>` | Store a named template variable (plain text, non-sensitive) for use as `{{name}}` in checker configs and snapshot commands |
+| `shelfard var get <name>` | Show a stored template variable's value |
+| `shelfard var list` | List all stored template variables |
+| `shelfard var unset <name>` | Delete a stored template variable |
 | `shelfard agent [--model MODEL]` | Interactive schema assistant; spawns MCP server internally; auto-detects Claude or OpenAI from env |
 | `shelfard mcp` | Start the MCP server (stdio transport) — for use with Claude Desktop, Cursor, or any MCP client |
 
@@ -55,15 +60,15 @@ Shelfard/
 ├── shelfard/                        # Python package — all source lives here
 │   ├── __init__.py               # Re-exports all public symbols
 │   ├── models.py                 # Core data structures: ColumnSchema, TableSchema, ConsumerSubscription, SchemaDiff, RestCheckerConfig, PostgresCheckerConfig, etc.
-│   ├── cli.py                    # CLI entry point — show, list, subscribe, rest snapshot/check, postgres snapshot/check, checker, agent
+│   ├── cli.py                    # CLI entry point — show, list, subscribe, rest snapshot/check, postgres snapshot/check, checker, var, agent
 │   ├── registry/                 # Pluggable registry package
 │   │   ├── __init__.py           # Re-exports + _default LocalFileRegistry instance (backward-compat shims)
-│   │   ├── base.py               # SchemaRegistry ABC — 12 methods (source schemas, subscriptions, impact analysis, checkers)
+│   │   ├── base.py               # SchemaRegistry ABC — 16 methods (source schemas, subscriptions, impact analysis, checkers, template vars); concrete resolve_template()
 │   │   ├── local.py              # LocalFileRegistry(registry_dir=None) — file-based implementation
 │   │   ├── s3.py                 # S3Registry(bucket, prefix) — stub
 │   │   ├── gcs.py                # GCSRegistry(bucket, prefix) — stub
 │   │   └── sql.py                # SQLRegistry(connection_string) — stub
-│   ├── mcp_server.py             # FastMCP server — get_schema (+ checker info), get_schemas, get_subscriptions, get_subscription, register_checker, get_checker_config, live_check_schema (stdio)
+│   ├── mcp_server.py             # FastMCP server — get_schema (+ checker info), get_schemas, get_subscriptions, get_subscription, register_checker, get_checker_config, live_check_schema, set_template_var, get_template_var, list_template_vars, delete_template_var (stdio)
 │   ├── agent.py                  # run_agent() async REPL — spawns MCP server via MultiServerMCPClient, supports Claude + OpenAI
 │   ├── schema_comparison.py      # Layer 2: Diff schemas, classify changes by severity
 │   ├── type_normalizer.py        # Vendor-agnostic utilities: TYPE_WIDENING_RULES, is_safe_widening, extract_length
@@ -94,7 +99,8 @@ Shelfard/
 │   ├── rest_tests.py             # 7 REST integration tests (mock HTTP server, no real network)
 │   ├── postgresql_tests.py       # 12 PostgreSQL reader + checker tests (mocked psycopg2)
 │   ├── registry_tests.py         # 10 schema registry + consumer subscription tests
-│   └── parsers_tests.py          # 12 JSON file reader + STRUCT inference tests
+│   ├── parsers_tests.py          # 12 JSON file reader + STRUCT inference tests
+│   └── vars_tests.py             # 16 template variable storage + {{var}} resolution tests
 ├── docker/
 │   ├── Dockerfile.test           # Smoke test image — fresh pip install + all CLI commands on every `docker run`
 │   ├── Dockerfile.playground     # Interactive sandbox — shelfard pre-installed, registry pre-seeded
@@ -110,7 +116,8 @@ Shelfard/
 ├── schemas/                      # File-based registry root (auto-created on first write)
 │   ├── sources/                  # Versioned source schema files — one JSON per table
 │   ├── consumers/                # Consumer subscriptions — one JSON per consumer/table pair
-│   └── checkers/                 # Checker configs — one JSON per schema (not versioned, always overwrites)
+│   ├── checkers/                 # Checker configs — one JSON per schema (not versioned, always overwrites)
+│   └── vars.json                 # Template variables — flat dict {name: value} (not versioned, always overwrites)
 └── CLAUDE.md
 ```
 
@@ -118,7 +125,7 @@ Importing: `from shelfard import ColumnSchema, get_sqlite_schema, compare_schema
 
 ### Adding a new registry backend
 1. Create `shelfard/registry/<backend>.py` with a class extending `SchemaRegistry`
-2. Implement all 12 abstract methods (source schemas, consumer subscriptions, impact analysis, checkers)
+2. Implement all 16 abstract methods (source schemas, consumer subscriptions, impact analysis, checkers, template vars); `resolve_template` is a concrete base-class method and does not need to be overridden
 3. Re-export from `shelfard/registry/__init__.py` and `shelfard/__init__.py`
 
 ### Adding a new vendor tool
@@ -159,6 +166,7 @@ conda run -n shelfard python3 tests/registry_tests.py    # 10 tests: registry + 
 conda run -n shelfard python3 tests/parsers_tests.py     # 12 tests: JSON file reader + STRUCT inference
 conda run -n shelfard python3 tests/rest_tests.py        # 7 tests: REST reader (mock HTTP server, no real network)
 conda run -n shelfard python3 tests/postgresql_tests.py  # 12 tests: PostgreSQL reader + checker (mocked psycopg2)
+conda run -n shelfard python3 tests/vars_tests.py        # 16 tests: template variable storage + {{var}} resolution
 ```
 
 ### Docker — smoke test (rerunnable, fresh install each time)
@@ -213,10 +221,12 @@ See `docs/test.md` for the full testing guide.
 - All public functions return `ToolResult` for LLM agent compatibility
 - Severity classification is deterministic — do not involve LLM for clear-cut cases
 - `SchemaRegistry` is an ABC — swap backends by instantiating a different class; module-level functions delegate to a `LocalFileRegistry` default instance
-- `LocalFileRegistry` storage: `schemas/sources/<table>.json` (versioned list), `schemas/consumers/<consumer>/<table>.json` (versioned list), `schemas/checkers/<schema>.json` (single dict, always overwritten)
+- `LocalFileRegistry` storage: `schemas/sources/<table>.json` (versioned list), `schemas/consumers/<consumer>/<table>.json` (versioned list), `schemas/checkers/<schema>.json` (single dict, always overwritten), `schemas/vars.json` (flat dict, always overwritten)
 - Checker env vars: resolved from `os.environ` at `Checker.run()` time; never stored as values. Use `$VAR_NAME` in url/header values (REST) or dsn/query (PostgreSQL); list the name in `env`. `LocalFileRegistry.run_checker()` dispatches to `RestChecker` or `PostgresChecker` based on `checker_type`.
+- Template variables (`{{var_name}}`): non-sensitive config values (hosts, base URLs) stored in `schemas/vars.json` via `set_var`/`get_var`/`list_vars`/`delete_var`. Resolved in checker URL/DSN/headers and snapshot CLI args **before** `$ENV_VAR` substitution. Name format: `[a-zA-Z_][a-zA-Z0-9_]*`. Unknown `{{vars}}` left as-is (no error). `SchemaRegistry.resolve_template(template)` is a concrete base-class method — no need to override in new backends.
+- `--create-checker` on snapshot commands: after a successful snapshot, auto-builds and registers a checker from the same connection args. `_extract_env_vars(*templates)` in `cli.py` scans URL/DSN/header values for `$VAR_NAME` patterns (regex `\$([A-Z_][A-Z0-9_]*)`) and populates `env` automatically — no `--env` flag needed. Stores the raw (pre-`{{var}}`-resolution) URL/DSN so the checker can resolve at run time. Checker registration failure is non-fatal (prints warning, exits 0).
 - PostgreSQL query mode nullability contract: columns with zero NULL values across a `LIMIT sample_size` sample are marked `NOT NULL`; any NULL or empty result → nullable (conservative).
 - `SchemaReader.get_schema()` takes no arguments — the target is fixed in the constructor
-- `run_tests.py` contains ~25 basic tests (SQLite introspection, schema comparison, STRUCT drift); domain-specific tests live in `tests/` (`registry_tests.py`, `parsers_tests.py`, `rest_tests.py`, `postgresql_tests.py`); all files use a custom minimal test runner (no pytest)
+- `run_tests.py` contains ~25 basic tests (SQLite introspection, schema comparison, STRUCT drift); domain-specific tests live in `tests/` (`registry_tests.py`, `parsers_tests.py`, `rest_tests.py`, `postgresql_tests.py`, `vars_tests.py`); all files use a custom minimal test runner (no pytest)
 - Registry test isolation: patch `registry._default._root = Path(tmp)` inside a `tempfile.TemporaryDirectory()` block
 - CLI uses argparse with `dest="command"` at the top level; all commands dispatch via `args.func(args)`; `_print_schema(schema_dict, indent)` recurses into STRUCT fields

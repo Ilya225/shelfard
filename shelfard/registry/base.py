@@ -7,6 +7,7 @@ All methods return ToolResult so they are usable directly as LLM agent tools.
 
 from __future__ import annotations
 
+import re
 from abc import ABC, abstractmethod
 from typing import Optional
 
@@ -122,6 +123,52 @@ class SchemaRegistry(ABC):
         Returns the same ToolResult as Checker.run().
         """
         ...
+
+    # ── Template variables ────────────────────────────────────────────────────
+
+    @abstractmethod
+    def set_var(self, name: str, value: str) -> ToolResult:
+        """Store a named template variable. Overwrites if already set."""
+        ...
+
+    @abstractmethod
+    def get_var(self, name: str) -> ToolResult:
+        """
+        Retrieve a stored template variable by name.
+
+        Returns ToolResult with data={"name": ..., "value": ...}.
+        """
+        ...
+
+    @abstractmethod
+    def list_vars(self) -> ToolResult:
+        """
+        List all stored template variables.
+
+        Returns ToolResult with data={"vars": {"name": "value", ...}}.
+        """
+        ...
+
+    @abstractmethod
+    def delete_var(self, name: str) -> ToolResult:
+        """
+        Delete a stored template variable by name.
+
+        Returns ToolResult with success=False and an informative error if not found.
+        """
+        ...
+
+    def resolve_template(self, template: str) -> str:
+        """
+        Replace every {{name}} in template with the stored variable value.
+
+        Unknown variables are left as-is (no KeyError). Resolution is performed
+        with a single regex pass to avoid double-substitution.
+        """
+        def _replace(match: re.Match) -> str:
+            result = self.get_var(match.group(1))
+            return result.data["value"] if result.success else match.group(0)
+        return re.sub(r"\{\{([a-zA-Z_][a-zA-Z0-9_]*)\}\}", _replace, template)
 
     # ── Impact analysis ───────────────────────────────────────────────────────
 

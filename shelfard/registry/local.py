@@ -324,6 +324,16 @@ class LocalFileRegistry(SchemaRegistry):
     def _checker_path(self, schema_name: str) -> Path:
         return self._checkers_dir() / f"{schema_name}.json"
 
+    def _vars_path(self) -> Path:
+        return self._root / "vars.json"
+
+    def _load_vars(self) -> dict:
+        path = self._vars_path()
+        return self._load_json(path) if path.exists() else {}
+
+    def _save_vars(self, data: dict) -> None:
+        self._save_json(self._vars_path(), data)
+
     def register_checker(
         self,
         schema_name: str,
@@ -398,6 +408,59 @@ class LocalFileRegistry(SchemaRegistry):
                 success=False,
                 error=f"Unknown checker type: {checker_type!r}",
             )
+
+    # ── Template variables ────────────────────────────────────────────────────
+
+    def set_var(self, name: str, value: str) -> ToolResult:
+        """Store a named template variable. Overwrites if already set."""
+        try:
+            vars_data = self._load_vars()
+            vars_data[name] = value
+            self._save_vars(vars_data)
+            return ToolResult(
+                success=True,
+                data={"name": name, "value": value},
+                next_action_hint=f"Use {{{{{{name}}}}}} in checker configs or snapshot URLs.",
+            )
+        except Exception as e:
+            return ToolResult(success=False, error=f"Failed to set var '{name}': {e}")
+
+    def get_var(self, name: str) -> ToolResult:
+        """Retrieve a stored template variable by name."""
+        try:
+            vars_data = self._load_vars()
+            if name not in vars_data:
+                return ToolResult(
+                    success=False,
+                    error=f"Template variable '{name}' not found.",
+                    next_action_hint=f"Set it with: shelfard var set {name} <value>",
+                )
+            return ToolResult(success=True, data={"name": name, "value": vars_data[name]})
+        except Exception as e:
+            return ToolResult(success=False, error=f"Failed to get var '{name}': {e}")
+
+    def list_vars(self) -> ToolResult:
+        """List all stored template variables."""
+        try:
+            vars_data = self._load_vars()
+            return ToolResult(success=True, data={"vars": vars_data})
+        except Exception as e:
+            return ToolResult(success=False, error=f"Failed to list vars: {e}")
+
+    def delete_var(self, name: str) -> ToolResult:
+        """Delete a stored template variable by name."""
+        try:
+            vars_data = self._load_vars()
+            if name not in vars_data:
+                return ToolResult(
+                    success=False,
+                    error=f"Template variable '{name}' does not exist.",
+                )
+            del vars_data[name]
+            self._save_vars(vars_data)
+            return ToolResult(success=True, data={"deleted": name})
+        except Exception as e:
+            return ToolResult(success=False, error=f"Failed to delete var '{name}': {e}")
 
     # ── Impact analysis ───────────────────────────────────────────────────────
 

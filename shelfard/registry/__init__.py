@@ -38,6 +38,11 @@ __all__ = [
     "get_checker",
     "get_all_checkers",
     "run_checker",
+    # template variable shims
+    "set_var",
+    "get_var",
+    "list_vars",
+    "delete_var",
 ]
 
 # ── Default instance ──────────────────────────────────────────────────────────
@@ -58,3 +63,8 @@ register_checker             = _default.register_checker
 get_checker                  = _default.get_checker
 get_all_checkers             = _default.get_all_checkers
 run_checker                  = _default.run_checker
+
+set_var                      = _default.set_var
+get_var                      = _default.get_var
+list_vars                    = _default.list_vars
+delete_var                   = _default.delete_var

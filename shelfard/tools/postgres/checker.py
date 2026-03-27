@@ -30,11 +30,18 @@ class PostgresChecker(Checker):
                 next_action_hint=f"Export the missing variables before running: {', '.join(missing)}",
             )
 
+        # 1.5 — Resolve {{template_vars}} from registry (before $ENV_VAR substitution)
+        dsn_template = self.registry.resolve_template(self.config.dsn)
+        query_template = (
+            self.registry.resolve_template(self.config.query)
+            if self.config.query else None
+        )
+
         # 2. Resolve $VAR placeholders in DSN and query (if any)
-        resolved_dsn = _substitute(self.config.dsn, self.config.env)
+        resolved_dsn = _substitute(dsn_template, self.config.env)
         resolved_query = (
-            _substitute(self.config.query, self.config.env)
-            if self.config.query
+            _substitute(query_template, self.config.env)
+            if query_template
             else None
         )
 

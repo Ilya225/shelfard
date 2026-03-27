@@ -28,6 +28,10 @@ from .registry import (
     get_checker,
     register_checker as _register_checker,
     run_checker as _run_checker,
+    set_var as _set_var,
+    get_var as _get_var,
+    list_vars as _list_vars,
+    delete_var as _delete_var,
 )
 
 
@@ -99,6 +103,31 @@ def get_checker_config(schema_name: str) -> str:
 def live_check_schema(schema_name: str) -> str:
     """Run the registered checker for a schema against the live endpoint and return the drift result."""
     return _run_checker(schema_name).to_json()
+
+
+@mcp.tool()
+def set_template_var(name: str, value: str) -> str:
+    """Store a named template variable for use as {{name}} in checker configs and snapshot
+    commands. Values are plain text — use $ENV_VAR for secrets."""
+    return _set_var(name, value).to_json()
+
+
+@mcp.tool()
+def get_template_var(name: str) -> str:
+    """Retrieve a stored template variable by name."""
+    return _get_var(name).to_json()
+
+
+@mcp.tool()
+def list_template_vars() -> str:
+    """List all stored template variables and their values."""
+    return _list_vars().to_json()
+
+
+@mcp.tool()
+def delete_template_var(name: str) -> str:
+    """Delete a stored template variable by name."""
+    return _delete_var(name).to_json()
 
 
 def run() -> None:

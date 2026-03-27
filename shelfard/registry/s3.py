@@ -48,5 +48,29 @@ class S3Registry(SchemaRegistry):
     def get_all_consumers(self):
         raise NotImplementedError(_MSG)
 
+    def register_checker(self, schema_name, config):
+        raise NotImplementedError(_MSG)
+
+    def get_checker(self, schema_name):
+        raise NotImplementedError(_MSG)
+
+    def get_all_checkers(self):
+        raise NotImplementedError(_MSG)
+
+    def run_checker(self, schema_name):
+        raise NotImplementedError(_MSG)
+
+    def set_var(self, name, value):
+        raise NotImplementedError(_MSG)
+
+    def get_var(self, name):
+        raise NotImplementedError(_MSG)
+
+    def list_vars(self):
+        raise NotImplementedError(_MSG)
+
+    def delete_var(self, name):
+        raise NotImplementedError(_MSG)
+
     def get_consumers_affected_by_diff(self, table_name, diff):
         raise NotImplementedError(_MSG)

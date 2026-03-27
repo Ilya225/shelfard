@@ -12,6 +12,7 @@ Usage:
 """
 
 import argparse
+import re
 import sys
 
 from shelfard import (
@@ -20,8 +21,10 @@ from shelfard import (
     get_all_schemas, get_all_consumers, subscribe_consumer,
     RestCheckerConfig, PostgresCheckerConfig,
     register_checker, get_checker, get_all_checkers, run_checker,
+    set_var, get_var, list_vars, delete_var,
 )
 from shelfard.models import ChangeSeverity
+from shelfard.registry import _default as _registry
 
 
 # ── ANSI colours ──────────────────────────────────────────────────────────────
@@ -40,6 +43,23 @@ def bold(t: str)   -> str: return _colour(t, "1")
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _resolve_template_vars(text: str) -> str:
+    """Resolve {{var_name}} references from the registry before use."""
+    return _registry.resolve_template(text)
+
+
+def _extract_env_vars(*templates: str) -> list[str]:
+    """Return unique $VAR_NAME names found across all template strings, in order of first appearance."""
+    seen: set[str] = set()
+    result: list[str] = []
+    for t in templates:
+        for name in re.findall(r'\$([A-Z_][A-Z0-9_]*)', t):
+            if name not in seen:
+                result.append(name)
+                seen.add(name)
+    return result
+
 
 def _parse_headers(header_list: list[str]) -> dict[str, str]:
     """Parse ['Key=Value', ...] into a dict, warning on malformed entries."""
@@ -119,10 +139,11 @@ def _print_schema(schema_dict: dict, indent: int = 0) -> None:
 def cmd_rest_snapshot(args) -> int:
     schema_name = args.name
     headers = _parse_headers(args.header)
+    url = _resolve_template_vars(args.url)
 
-    print(f"Fetching {args.url} …")
+    print(f"Fetching {url} …")
     result = RestEndpointReader(
-        args.url, schema_name,
+        url, schema_name,
         bearer_token=args.bearer or None,
         headers=headers or None,
     ).get_schema()
@@ -140,16 +161,42 @@ def cmd_rest_snapshot(args) -> int:
     version = reg.data["version_count"]
     col_count = len(schema.columns)
     print(green(f"✓ Snapshot saved: '{schema_name}' (version {version}, {col_count} top-level columns)"))
+
+    if getattr(args, "create_checker", False):
+        headers_list = []
+        for item in args.header or []:
+            if "=" not in item:
+                continue
+            k, _, v = item.partition("=")
+            headers_list.append({k.strip(): v.strip()})
+        if args.bearer:
+            headers_list.append({"Authorization": f"Bearer {args.bearer}"})
+        header_values = [v for h in headers_list for v in h.values()]
+        env = _extract_env_vars(args.url, *header_values)
+        config = RestCheckerConfig(
+            schema_name=schema_name,
+            url=args.url,
+            headers=headers_list,
+            env=env,
+        )
+        cr = register_checker(schema_name, config)
+        if cr.success:
+            env_str = f"{len(env)} env var{'s' if len(env) != 1 else ''}"
+            print(green(f"✓ Checker registered for '{schema_name}'") + f"  (rest · {env_str})")
+        else:
+            print(yellow(f"⚠ Snapshot saved but checker registration failed: {cr.error}"))
+
     return 0
 
 
 def cmd_rest_check(args) -> int:
     schema_name = args.name
     headers = _parse_headers(args.header)
+    url = _resolve_template_vars(args.url)
 
-    print(f"Fetching {args.url} …")
+    print(f"Fetching {url} …")
     new_result = RestEndpointReader(
-        args.url, schema_name,
+        url, schema_name,
         bearer_token=args.bearer or None,
         headers=headers or None,
     ).get_schema()
@@ -161,7 +208,7 @@ def cmd_rest_check(args) -> int:
     baseline_result = get_registered_schema(schema_name)
     if not baseline_result.success:
         print(red(f"✗ No snapshot found for '{schema_name}'."))
-        print(f"  Run:  shelfard rest snapshot {args.url} --name {args.name}")
+        print(f"  Run:  shelfard rest snapshot {url} --name {args.name}")
         return 2
 
     diff_result = compare_schemas_from_dicts(
@@ -181,14 +228,16 @@ def cmd_rest_check(args) -> int:
 
 def cmd_postgres_snapshot(args) -> int:
     schema_name = args.name
+    dsn = _resolve_template_vars(args.dsn)
+    query = _resolve_template_vars(args.query) if args.query else None
     target = args.table or "(custom query)"
     print(f"Reading PostgreSQL '{target}' …")
 
     result = PostgresReader(
-        args.dsn,
+        dsn,
         schema_name,
         table=args.table or None,
-        query=args.query or None,
+        query=query,
         db_schema=args.db_schema,
     ).get_schema()
 
@@ -207,19 +256,40 @@ def cmd_postgres_snapshot(args) -> int:
     version = reg.data["version_count"]
     col_count = len(schema.columns)
     print(green(f"✓ Snapshot saved: '{schema_name}' (version {version}, {col_count} top-level columns)"))
+
+    if getattr(args, "create_checker", False):
+        templates = [args.dsn] + ([args.query] if args.query else [])
+        env = _extract_env_vars(*templates)
+        config = PostgresCheckerConfig(
+            schema_name=schema_name,
+            dsn=args.dsn,
+            env=env,
+            table=args.table or None,
+            query=args.query or None,
+            db_schema=args.db_schema,
+        )
+        cr = register_checker(schema_name, config)
+        if cr.success:
+            env_str = f"{len(env)} env var{'s' if len(env) != 1 else ''}"
+            print(green(f"✓ Checker registered for '{schema_name}'") + f"  (postgres · {env_str})")
+        else:
+            print(yellow(f"⚠ Snapshot saved but checker registration failed: {cr.error}"))
+
     return 0
 
 
 def cmd_postgres_check(args) -> int:
     schema_name = args.name
+    dsn = _resolve_template_vars(args.dsn)
+    query = _resolve_template_vars(args.query) if args.query else None
     target = args.table or "(custom query)"
     print(f"Reading PostgreSQL '{target}' …")
 
     new_result = PostgresReader(
-        args.dsn,
+        dsn,
         schema_name,
         table=args.table or None,
-        query=args.query or None,
+        query=query,
         db_schema=args.db_schema,
     ).get_schema()
 
@@ -490,6 +560,53 @@ def cmd_checker_list(_args) -> int:
     return 0
 
 
+# ── Var commands ──────────────────────────────────────────────────────────────
+
+def cmd_var_set(args) -> int:
+    result = set_var(args.name, args.value)
+    if not result.success:
+        print(red(f"✗ {result.error}"))
+        return 2
+    print(green(f"✓ Set {{{{ {args.name} }}}} = {args.value!r}"))
+    return 0
+
+
+def cmd_var_get(args) -> int:
+    result = get_var(args.name)
+    if not result.success:
+        print(red(f"✗ {result.error}"))
+        if result.next_action_hint:
+            print(f"  {result.next_action_hint}")
+        return 2
+    print(f"{args.name} = {result.data['value']!r}")
+    return 0
+
+
+def cmd_var_list(_args) -> int:
+    result = list_vars()
+    if not result.success:
+        print(red(f"✗ {result.error}"))
+        return 2
+    vars_dict = result.data["vars"]
+    if not vars_dict:
+        print("No template variables set.")
+        return 0
+    print(f"\nTemplate variables ({len(vars_dict)}):\n")
+    for name, value in sorted(vars_dict.items()):
+        print(f"  {{{{ {name:<20} }}}}  =  {value!r}")
+    print()
+    return 0
+
+
+def cmd_var_unset(args) -> int:
+    result = delete_var(args.name)
+    if not result.success:
+        print(red(f"✗ {result.error}"))
+        return 2
+    print(green(f"✓ Deleted template variable '{args.name}'"))
+    return 0
+
+
 # ── Agent command ─────────────────────────────────────────────────────────────
 
 def cmd_agent(args) -> int:
@@ -532,6 +649,10 @@ def _add_rest_subcommands(top) -> None:
         "snapshot", parents=[rest_base],
         help="Fetch the endpoint and save its schema to the registry",
     )
+    snap.add_argument(
+        "--create-checker", action="store_true", default=False,
+        help="Also register a checker config using the same URL and headers after snapshotting",
+    )
     snap.set_defaults(func=cmd_rest_snapshot)
 
     chk = rest_cmds.add_parser(
@@ -571,6 +692,10 @@ def _add_postgres_subcommands(top) -> None:
     snap = pg_cmds.add_parser(
         "snapshot", parents=[pg_base],
         help="Read a PostgreSQL table or query and save its schema to the registry",
+    )
+    snap.add_argument(
+        "--create-checker", action="store_true", default=False,
+        help="Also register a checker config using the same DSN and table/query after snapshotting",
     )
     snap.set_defaults(func=cmd_postgres_snapshot)
 
@@ -631,6 +756,27 @@ def _add_checker_subcommands(top) -> None:
     lst.set_defaults(func=cmd_checker_list)
 
 
+def _add_var_subcommands(top) -> None:
+    var_p = top.add_parser("var", help="Manage template variables ({{var_name}} syntax)")
+    var_cmds = var_p.add_subparsers(dest="command", required=True, metavar="COMMAND")
+
+    set_p = var_cmds.add_parser("set", help="Set a template variable")
+    set_p.add_argument("name", help="Variable name (alphanumeric + underscore)")
+    set_p.add_argument("value", help="Variable value (stored as plain text)")
+    set_p.set_defaults(func=cmd_var_set)
+
+    get_p = var_cmds.add_parser("get", help="Get a template variable's value")
+    get_p.add_argument("name", help="Variable name")
+    get_p.set_defaults(func=cmd_var_get)
+
+    lst = var_cmds.add_parser("list", help="List all template variables")
+    lst.set_defaults(func=cmd_var_list)
+
+    unset_p = var_cmds.add_parser("unset", help="Delete a template variable")
+    unset_p.add_argument("name", help="Variable name to delete")
+    unset_p.set_defaults(func=cmd_var_unset)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="shelfard",
@@ -651,6 +797,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_rest_subcommands(top)
     _add_postgres_subcommands(top)
     _add_checker_subcommands(top)
+    _add_var_subcommands(top)
 
     agent_p = top.add_parser(
         "agent",
