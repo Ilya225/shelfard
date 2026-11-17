@@ -24,6 +24,7 @@ from ..models import (
     RestCheckerConfig, PostgresCheckerConfig,
 )
 from .base import SchemaRegistry
+from ..security import ensure_within, validate_name, validate_var_name
 
 
 class LocalFileRegistry(SchemaRegistry):
@@ -46,11 +47,28 @@ class LocalFileRegistry(SchemaRegistry):
     def _consumers_dir(self) -> Path:
         return self._root / "consumers"
 
+    def _safe_path(self, *parts: str) -> Path:
+        """Join validated name parts under the registry root (path-traversal guard)."""
+        for part in parts:
+            err = validate_name(part.removesuffix(".json"))
+            if err:
+                raise ValueError(err)
+        return ensure_within(self._root, self._root.joinpath(*parts))
+
+    @staticmethod
+    def _invalid_names(**names: str) -> Optional[ToolResult]:
+        """Return a failed ToolResult if any name is unsafe for use in a file path."""
+        for kind, value in names.items():
+            err = validate_name(value, kind.replace("_", " "))
+            if err:
+                return ToolResult(success=False, error=err)
+        return None
+
     def _source_path(self, table_name: str) -> Path:
-        return self._sources_dir() / f"{table_name}.json"
+        return self._safe_path("sources", f"{table_name}.json")
 
     def _consumer_path(self, consumer_name: str, table_name: str) -> Path:
-        return self._consumers_dir() / consumer_name / f"{table_name}.json"
+        return self._safe_path("consumers", consumer_name, f"{table_name}.json")
 
     @staticmethod
     def _load_json(path: Path) -> dict:
@@ -67,6 +85,8 @@ class LocalFileRegistry(SchemaRegistry):
 
     def register_schema(self, table_name: str, schema: TableSchema) -> ToolResult:
         """Save a new version of a source schema."""
+        if invalid := self._invalid_names(table_name=table_name):
+            return invalid
         path = self._source_path(table_name)
         try:
             if path.exists():
@@ -91,6 +111,8 @@ class LocalFileRegistry(SchemaRegistry):
 
     def get_registered_schema(self, table_name: str, version: str = "latest") -> ToolResult:
         """Retrieve a source schema version from the registry."""
+        if invalid := self._invalid_names(table_name=table_name):
+            return invalid
         path = self._source_path(table_name)
 
         if not path.exists():
@@ -171,6 +193,8 @@ class LocalFileRegistry(SchemaRegistry):
         columns=None  → full subscription (snapshot all columns).
         columns=[...] → projection (only those columns are captured).
         """
+        if invalid := self._invalid_names(consumer_name=consumer_name, table_name=table_name):
+            return invalid
         source_result = self.get_registered_schema(table_name)
         if not source_result.success:
             return ToolResult(
@@ -244,6 +268,8 @@ class LocalFileRegistry(SchemaRegistry):
 
     def get_consumer_subscription(self, consumer_name: str, table_name: str) -> ToolResult:
         """Retrieve the latest subscription snapshot for a consumer/table pair."""
+        if invalid := self._invalid_names(consumer_name=consumer_name, table_name=table_name):
+            return invalid
         path = self._consumer_path(consumer_name, table_name)
 
         if not path.exists():
@@ -266,6 +292,8 @@ class LocalFileRegistry(SchemaRegistry):
 
     def get_consumers_for_table(self, table_name: str) -> ToolResult:
         """List all consumers subscribed to a given source table."""
+        if invalid := self._invalid_names(table_name=table_name):
+            return invalid
         consumers_dir = self._consumers_dir()
         if not consumers_dir.exists():
             return ToolResult(success=True, data={"consumers": []})
@@ -322,7 +350,7 @@ class LocalFileRegistry(SchemaRegistry):
         return self._root / "checkers"
 
     def _checker_path(self, schema_name: str) -> Path:
-        return self._checkers_dir() / f"{schema_name}.json"
+        return self._safe_path("checkers", f"{schema_name}.json")
 
     def _vars_path(self) -> Path:
         return self._root / "vars.json"
@@ -340,6 +368,13 @@ class LocalFileRegistry(SchemaRegistry):
         config: RestCheckerConfig | PostgresCheckerConfig,
     ) -> ToolResult:
         """Store a checker config. Always overwrites — checkers are not versioned."""
+        if invalid := self._invalid_names(schema_name=schema_name):
+            return invalid
+        if config.schema_name != schema_name:
+            return ToolResult(
+                success=False,
+                error=f"Config schema_name {config.schema_name!r} does not match {schema_name!r}.",
+            )
         config.registered_at = datetime.utcnow().isoformat()
         path = self._checker_path(schema_name)
         try:
@@ -353,6 +388,8 @@ class LocalFileRegistry(SchemaRegistry):
 
     def get_checker(self, schema_name: str) -> ToolResult:
         """Retrieve the checker config for the given schema."""
+        if invalid := self._invalid_names(schema_name=schema_name):
+            return invalid
         path = self._checker_path(schema_name)
         if not path.exists():
             return ToolResult(
@@ -413,6 +450,8 @@ class LocalFileRegistry(SchemaRegistry):
 
     def set_var(self, name: str, value: str) -> ToolResult:
         """Store a named template variable. Overwrites if already set."""
+        if err := validate_var_name(name):
+            return ToolResult(success=False, error=err)
         try:
             vars_data = self._load_vars()
             vars_data[name] = value
