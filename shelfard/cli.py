@@ -611,15 +611,15 @@ def cmd_var_unset(args) -> int:
 
 def cmd_agent(args) -> int:
     from shelfard.agent import run_agent
-    run_agent(model=args.model)
+    run_agent(model=args.model, allow_writes=args.allow_writes)
     return 0
 
 
 # ── MCP server command ────────────────────────────────────────────────────────
 
-def cmd_mcp(_args) -> int:
+def cmd_mcp(args) -> int:
     from shelfard.mcp_server import run
-    run()
+    run(allow_writes=True if args.allow_writes else None)
     return 0
 
 
@@ -801,14 +801,22 @@ def build_parser() -> argparse.ArgumentParser:
 
     agent_p = top.add_parser(
         "agent",
-        help="Start an interactive schema assistant (Claude or OpenAI)",
+        help="Start an interactive schema assistant (Claude, OpenAI, or Ollama)",
     )
     agent_p.add_argument(
         "--model", metavar="MODEL", default=None,
         help=(
-            "Model to use: provider shorthand ('anthropic', 'openai') or a specific "
-            "model ID ('claude-sonnet-4-6', 'gpt-4o', 'gpt-4o-mini', ...). "
-            "If omitted, auto-detected from ANTHROPIC_API_KEY or OPENAI_API_KEY."
+            "Model to use: provider shorthand ('anthropic', 'openai', 'ollama'), a specific "
+            "model ID ('claude-sonnet-4-6', 'gpt-4o', ...), or 'ollama:<model>' for a local "
+            "Ollama model ('ollama:qwen2.5:7b'). If omitted, auto-detected from "
+            "ANTHROPIC_API_KEY, OPENAI_API_KEY, or OLLAMA_MODEL."
+        ),
+    )
+    agent_p.add_argument(
+        "--allow-writes", action="store_true",
+        help=(
+            "Let the agent register checkers and modify template variables "
+            "(off by default; write tools are guarded but still risky with untrusted data)."
         ),
     )
     agent_p.set_defaults(func=cmd_agent)
@@ -816,6 +824,13 @@ def build_parser() -> argparse.ArgumentParser:
     mcp_p = top.add_parser(
         "mcp",
         help="Start the Shelfard MCP server (stdio transport)",
+    )
+    mcp_p.add_argument(
+        "--allow-writes", action="store_true",
+        help=(
+            "Expose register_checker / set_template_var / delete_template_var "
+            "(or set SHELFARD_MCP_ALLOW_WRITES=1). Off by default."
+        ),
     )
     mcp_p.set_defaults(func=cmd_mcp)
 

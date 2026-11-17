@@ -43,6 +43,7 @@ __all__ = [
     "get_var",
     "list_vars",
     "delete_var",
+    "resolve_template",
 ]
 
 # ── Default instance ──────────────────────────────────────────────────────────
@@ -68,3 +69,4 @@ set_var                      = _default.set_var
 get_var                      = _default.get_var
 list_vars                    = _default.list_vars
 delete_var                   = _default.delete_var
+resolve_template             = _default.resolve_template

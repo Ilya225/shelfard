@@ -443,6 +443,10 @@ shelfard agent
 # OpenAI (if OPENAI_API_KEY is set)
 export OPENAI_API_KEY=<your-key>
 shelfard agent
+
+# Local Ollama model (if OLLAMA_MODEL is set and no API key is present)
+export OLLAMA_MODEL=qwen2.5:7b
+shelfard agent
 ```
 
 ### Explicit model selection
@@ -459,10 +463,41 @@ shelfard agent --model gpt-4o-mini
 
 The `--model` flag requires the corresponding API key to be set (`ANTHROPIC_API_KEY` for Claude models, `OPENAI_API_KEY` for OpenAI models).
 
+### Local models with Ollama
+
+Run the agent fully locally with [Ollama](https://ollama.com) — no API key needed.
+
+```bash
+pip install "shelfard[ollama]"        # installs langchain-ollama
+ollama pull qwen2.5:7b
+
+shelfard agent --model ollama                 # $OLLAMA_MODEL, or qwen2.5:7b
+shelfard agent --model ollama:qwen2.5:7b      # specific model (tag after the first colon)
+shelfard agent --model ollama:llama3.1:8b
+```
+
+| Env var | Default | Purpose |
+|---|---|---|
+| `OLLAMA_HOST` | `http://localhost:11434` | Ollama server URL |
+| `OLLAMA_MODEL` | — | Default model for `--model ollama` and auto-detection |
+| `OLLAMA_NUM_CTX` | `8192` | Context window; raise it for large schemas |
+
+The model **must support tool calling** (e.g. `qwen2.5`, `qwen3`, `llama3.1`/`3.2`, `mistral-nemo`). Small models (<7B) call tools less reliably.
+
+### Read-only by default
+
+The agent starts in **read-only** mode: it can inspect schemas, subscriptions, checkers, and template variables, and run live checks on existing checkers. To let it register checkers and modify template variables, pass `--allow-writes`:
+
+```bash
+shelfard agent --allow-writes
+```
+
+Even in write mode, see [MCP security](#security) for the guards that apply. The agent's MCP subprocess only receives `SHELFARD_*` env vars and names listed in `SHELFARD_MCP_ENV_ALLOWLIST` — your LLM API keys are never passed to it.
+
 ### Example session
 
 ```
-Shelfard Agent  [claude-sonnet-4-6]  (type 'exit' to quit)
+Shelfard Agent  [anthropic: claude-sonnet-4-6]  [read-only]  (type 'exit' to quit)
 
 You: what schemas do I have?
 Agent: You have 2 schemas stored:
@@ -479,7 +514,7 @@ Agent: The posts schema has 4 columns:
 You: exit
 ```
 
-The agent has access to all Shelfard MCP tools: `get_schemas`, `get_schema` (includes checker info), `get_subscriptions`, `get_subscription`, `register_checker`, `get_checker_config`, `live_check_schema`, `set_template_var`, `get_template_var`, `list_template_vars`, `delete_template_var`. It can answer questions, summarise schema shapes, register checkers, manage template variables, and run live drift checks.
+The agent has access to the Shelfard MCP read tools — `get_schemas`, `get_schema` (includes checker info), `get_subscriptions`, `get_subscription`, `get_checker_config`, `live_check_schema`, `get_template_var`, `list_template_vars` — plus, with `--allow-writes`, `register_checker`, `set_template_var`, and `delete_template_var`.
 
 ---
 
@@ -490,10 +525,11 @@ Shelfard exposes its registry as a standalone **Model Context Protocol server**,
 ### Start the server
 
 ```bash
-shelfard mcp
+shelfard mcp                  # read-only tools (default)
+shelfard mcp --allow-writes   # also expose write tools (or SHELFARD_MCP_ALLOW_WRITES=1)
 ```
 
-The server runs over **stdio** (the MCP standard for local tools). It exposes eleven tools:
+The server runs over **stdio** (the MCP standard for local tools). It exposes eight read tools, plus three write tools (marked ✎) when started with `--allow-writes`:
 
 | Tool | Description |
 |---|---|
@@ -501,13 +537,13 @@ The server runs over **stdio** (the MCP standard for local tools). It exposes el
 | `get_schema(schema_name)` | Retrieve a specific schema with full column detail; includes checker info if registered |
 | `get_subscriptions` | List all consumer subscriptions |
 | `get_subscription(consumer_name, table_name)` | Retrieve a specific consumer subscription |
-| `register_checker(schema_name, url, env, headers)` | Register a REST checker config for a schema |
+| ✎ `register_checker(schema_name, url, env, headers)` | Register a **new** REST checker config for a schema (see [Security](#security)) |
 | `get_checker_config(schema_name)` | Retrieve the stored checker config (url, env vars, headers) |
 | `live_check_schema(schema_name)` | Run the registered checker against the live endpoint and return the drift result |
-| `set_template_var(name, value)` | Store a named template variable for use as `{{name}}` in checker configs and snapshot commands |
+| ✎ `set_template_var(name, value)` | Store a named template variable for use as `{{name}}` in checker configs and snapshot commands |
 | `get_template_var(name)` | Retrieve a stored template variable by name |
 | `list_template_vars()` | List all stored template variables and their values |
-| `delete_template_var(name)` | Delete a stored template variable by name |
+| ✎ `delete_template_var(name)` | Delete a stored template variable by name |
 
 ### Claude Desktop
 
@@ -529,6 +565,18 @@ Claude will then be able to call the Shelfard tools directly in any conversation
 ### Cursor / other MCP clients
 
 Point your MCP client at `shelfard mcp` with stdio transport. The server reads from the local registry (`./schemas/`) in the working directory where it is launched.
+
+### Security
+
+MCP tool inputs come from an LLM, and the LLM reads data that third parties control (field names returned by a REST API, for example). A prompt injection could otherwise trick it into sending your secrets to an attacker's URL, or writing files outside the registry. The server therefore treats every tool input as untrusted:
+
+- **Write tools are off by default.** `register_checker`, `set_template_var`, and `delete_template_var` are only exposed with `--allow-writes`.
+- **Env-var allowlist.** Checkers registered via MCP may only reference env vars prefixed with `SHELFARD_` or listed in `SHELFARD_MCP_ENV_ALLOWLIST` (comma-separated). `$ANTHROPIC_API_KEY`, `$AWS_SECRET_ACCESS_KEY`, etc. are rejected. Every `$VAR` in the URL/headers must be declared in `env`.
+- **SSRF guard.** Checkers registered via MCP must use `http(s)` and resolve to public addresses — loopback, private, link-local (e.g. `169.254.169.254` cloud metadata), and reserved ranges are rejected. Set `SHELFARD_MCP_ALLOW_PRIVATE_HOSTS=1` for local development.
+- **No tampering with existing checkers.** MCP cannot overwrite an existing checker, and cannot change or delete a template variable that a registered checker references.
+- **Path-traversal guard.** Schema, table, consumer, and checker names must match `[A-Za-z0-9_][A-Za-z0-9_.-]*` (no `/`, no `..`) — enforced in the registry for every entry point, CLI included.
+
+Checkers you register yourself with the CLI are trusted and not subject to the MCP allowlist or host restrictions.
 
 ---
 

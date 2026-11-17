@@ -17,8 +17,8 @@ Layered design — each layer is deterministic and agent-ready:
 - **Layer 2 — Comparison** (`shelfard/schema_comparison.py`): Pure deterministic diffing, produces self-documenting `SchemaDiff`
 - **Layer 2 — Checkers** (`shelfard/tools/*/checker.py`): Stored run configurations for drift checks. Two checker types are supported: `RestCheckerConfig` (URL + headers with `$VAR` placeholders and/or `{{var}}` template vars) and `PostgresCheckerConfig` (DSN with `$VAR` placeholders and/or `{{var}}` template vars + table or custom SQL query). Resolution order at `Checker.run()` time: `{{template_vars}}` from registry first, then `$ENV_VARS` from `os.environ`. `LocalFileRegistry.run_checker()` dispatches to the correct `Checker` subclass via the stored `checker_type` field.
 - **Layer 2 — Template Variables** (`shelfard/registry/`): Persistent key-value store for non-sensitive config values (hosts, base URLs, ports). Stored in `schemas/vars.json`. Referenced as `{{var_name}}` in checker configs and snapshot CLI commands. Managed via `shelfard var set/get/list/unset` or the MCP tools `set_template_var`, `get_template_var`, `list_template_vars`, `delete_template_var`. Distinct from `$ENV_VAR` (secrets, not stored).
-- **Layer 3 — MCP Server** (`shelfard/mcp_server.py`): Standalone FastMCP server exposing registry and checker tools over stdio — `get_schema` (includes checker info if registered), `get_schemas`, `get_subscriptions`, `get_subscription`, `register_checker`, `get_checker_config`, `live_check_schema`, `set_template_var`, `get_template_var`, `list_template_vars`, `delete_template_var`. Any MCP client (Claude Desktop, Cursor, etc.) can connect directly.
-- **Layer 3 — Agent** (`shelfard/agent.py`): Interactive LangChain 1.x assistant; spawns the MCP server as a subprocess via `MultiServerMCPClient` and gets its tools from there. Supports Claude and OpenAI; model resolved via `--model` flag or env-var auto-detection.
+- **Layer 3 — MCP Server** (`shelfard/mcp_server.py`): Standalone FastMCP server built by `build_server(allow_writes)`, stdio transport. Read tools (always): `get_schema` (includes checker info if registered), `get_schemas`, `get_subscriptions`, `get_subscription`, `get_checker_config`, `live_check_schema`, `get_template_var`, `list_template_vars`. Write tools (only with `--allow-writes` / `SHELFARD_MCP_ALLOW_WRITES=1`): `register_checker`, `set_template_var`, `delete_template_var`. Any MCP client (Claude Desktop, Cursor, etc.) can connect directly. See **MCP security model** below.
+- **Layer 3 — Agent** (`shelfard/agent.py`): Interactive LangChain 1.x assistant; spawns the MCP server as a subprocess via `MultiServerMCPClient` and gets its tools from there. Supports Claude, OpenAI, and local Ollama models (`langchain-ollama`, optional extra); model resolved via `--model` flag (`anthropic`, `openai`, `ollama`, `ollama:<model>`, or a model ID) or env-var auto-detection (`ANTHROPIC_API_KEY` → `OPENAI_API_KEY` → `OLLAMA_MODEL`). Read-only by default; `--allow-writes` spawns the server with write tools. The subprocess env only receives `SHELFARD_*` vars and names in `SHELFARD_MCP_ENV_ALLOWLIST` (LLM API keys are never forwarded).
 - **Future layers** (planned): Autonomous remediation suggestions, background drift monitoring, consumer-aware alerting
 
 All tools return `ToolResult` with: `success`, `data`, `error`, `next_action_hint`.
@@ -46,8 +46,8 @@ All tools return `ToolResult` with: `success`, `data`, `error`, `next_action_hin
 | `shelfard var get <name>` | Show a stored template variable's value |
 | `shelfard var list` | List all stored template variables |
 | `shelfard var unset <name>` | Delete a stored template variable |
-| `shelfard agent [--model MODEL]` | Interactive schema assistant; spawns MCP server internally; auto-detects Claude or OpenAI from env |
-| `shelfard mcp` | Start the MCP server (stdio transport) — for use with Claude Desktop, Cursor, or any MCP client |
+| `shelfard agent [--model MODEL] [--allow-writes]` | Interactive schema assistant; spawns MCP server internally; auto-detects Claude, OpenAI, or Ollama (`OLLAMA_MODEL`) from env; `--model ollama:<model>` for a local model; read-only unless `--allow-writes` |
+| `shelfard mcp [--allow-writes]` | Start the MCP server (stdio transport) — for use with Claude Desktop, Cursor, or any MCP client; write tools only with `--allow-writes` |
 
 Exit codes: `0` = success / no drift, `1` = drift detected, `2` = error.
 
@@ -68,8 +68,9 @@ Shelfard/
 │   │   ├── s3.py                 # S3Registry(bucket, prefix) — stub
 │   │   ├── gcs.py                # GCSRegistry(bucket, prefix) — stub
 │   │   └── sql.py                # SQLRegistry(connection_string) — stub
-│   ├── mcp_server.py             # FastMCP server — get_schema (+ checker info), get_schemas, get_subscriptions, get_subscription, register_checker, get_checker_config, live_check_schema, set_template_var, get_template_var, list_template_vars, delete_template_var (stdio)
-│   ├── agent.py                  # run_agent() async REPL — spawns MCP server via MultiServerMCPClient, supports Claude + OpenAI
+│   ├── mcp_server.py             # FastMCP server — build_server(allow_writes); read tools always, write tools (register_checker, set/delete_template_var) only with --allow-writes; guarded write tools (stdio)
+│   ├── agent.py                  # run_agent(model, allow_writes) async REPL — spawns MCP server via MultiServerMCPClient, supports Claude + OpenAI + Ollama
+│   ├── security.py               # validate_name (path traversal), validate_var_name, ensure_within, check_env_allowed (MCP env allowlist), check_url_safe (SSRF), extract_env_refs
 │   ├── schema_comparison.py      # Layer 2: Diff schemas, classify changes by severity
 │   ├── type_normalizer.py        # Vendor-agnostic utilities: TYPE_WIDENING_RULES, is_safe_widening, extract_length
 │   ├── tools/                    # Vendor tools — reader + checker co-located per vendor
@@ -100,7 +101,9 @@ Shelfard/
 │   ├── postgresql_tests.py       # 12 PostgreSQL reader + checker tests (mocked psycopg2)
 │   ├── registry_tests.py         # 10 schema registry + consumer subscription tests
 │   ├── parsers_tests.py          # 12 JSON file reader + STRUCT inference tests
-│   └── vars_tests.py             # 16 template variable storage + {{var}} resolution tests
+│   ├── vars_tests.py             # 16 template variable storage + {{var}} resolution tests
+│   ├── security_tests.py         # 24 path-traversal, MCP write gating, env allowlist, SSRF, tamper-guard tests
+│   └── agent_tests.py            # 20 model resolution (incl. Ollama), LLM construction, MCP subprocess wiring tests
 ├── docker/
 │   ├── Dockerfile.test           # Smoke test image — fresh pip install + all CLI commands on every `docker run`
 │   ├── Dockerfile.playground     # Interactive sandbox — shelfard pre-installed, registry pre-seeded
@@ -153,7 +156,7 @@ Each vendor's raw-type-to-`ColumnType` mapping lives exclusively in its own read
 ## Tech Stack
 
 - **Language**: Python 3.12 (conda env: `shelfard`)
-- **Dependencies**: `requests` (REST reader), `langchain` + `langchain-anthropic` + `langchain-openai` (agent), `mcp` + `langchain-mcp-adapters` (MCP server + client); all other code is stdlib. Declared in `pyproject.toml`. Optional: `psycopg2-binary>=2.9` for PostgreSQL (`pip install shelfard[postgres]`).
+- **Dependencies**: `requests` (REST reader), `langchain` + `langchain-anthropic` + `langchain-openai` (agent), `mcp` + `langchain-mcp-adapters` (MCP server + client); all other code is stdlib. Declared in `pyproject.toml` with security floors (`langchain-core>=1.2.16`, `langgraph-checkpoint>=4.0.1`; `mcp<2`). Optional: `psycopg2-binary>=2.9` for PostgreSQL (`pip install shelfard[postgres]`), `langchain-ollama>=1.0` for local Ollama models (`pip install shelfard[ollama]`).
 - **Supported sources**: SQLite, REST API endpoints, PostgreSQL (table/view introspection + custom SQL queries); Snowflake, BigQuery (type maps only, readers pending)
 
 ### Running tests
@@ -167,6 +170,8 @@ conda run -n shelfard python3 tests/parsers_tests.py     # 12 tests: JSON file r
 conda run -n shelfard python3 tests/rest_tests.py        # 7 tests: REST reader (mock HTTP server, no real network)
 conda run -n shelfard python3 tests/postgresql_tests.py  # 12 tests: PostgreSQL reader + checker (mocked psycopg2)
 conda run -n shelfard python3 tests/vars_tests.py        # 16 tests: template variable storage + {{var}} resolution
+conda run -n shelfard python3 tests/security_tests.py    # 24 tests: path traversal, MCP write gating, env allowlist, SSRF
+conda run -n shelfard python3 tests/agent_tests.py       # 20 tests: model resolution (incl. Ollama), MCP subprocess wiring
 ```
 
 ### Docker — smoke test (rerunnable, fresh install each time)
@@ -228,5 +233,7 @@ See `docs/test.md` for the full testing guide.
 - PostgreSQL query mode nullability contract: columns with zero NULL values across a `LIMIT sample_size` sample are marked `NOT NULL`; any NULL or empty result → nullable (conservative).
 - `SchemaReader.get_schema()` takes no arguments — the target is fixed in the constructor
 - `run_tests.py` contains ~25 basic tests (SQLite introspection, schema comparison, STRUCT drift); domain-specific tests live in `tests/` (`registry_tests.py`, `parsers_tests.py`, `rest_tests.py`, `postgresql_tests.py`, `vars_tests.py`); all files use a custom minimal test runner (no pytest)
+- **Name validation**: every registry entry point that builds a file path validates names with `security.validate_name` (`[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}`, no `..`) and `_safe_path` checks the resolved path stays under `_root`. Template var names use `validate_var_name`. New backends should call these too.
+- **MCP security model**: MCP tool inputs are LLM-controlled and therefore untrusted (the LLM reads third-party data such as remote API field names). Write tools are opt-in (`--allow-writes`). MCP `register_checker` enforces: env vars must be `SHELFARD_*` or in `SHELFARD_MCP_ENV_ALLOWLIST`; every `$VAR` referenced must be declared in `env`; URL must be http(s) and resolve to public IPs unless `SHELFARD_MCP_ALLOW_PRIVATE_HOSTS=1`; existing checkers cannot be overwritten. MCP `set_template_var`/`delete_template_var` refuse vars referenced by any registered checker. CLI-registered checkers are trusted and not subject to these MCP-only checks.
 - Registry test isolation: patch `registry._default._root = Path(tmp)` inside a `tempfile.TemporaryDirectory()` block
 - CLI uses argparse with `dest="command"` at the top level; all commands dispatch via `args.func(args)`; `_print_schema(schema_dict, indent)` recurses into STRUCT fields
