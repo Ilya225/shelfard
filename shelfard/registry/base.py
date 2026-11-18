@@ -11,7 +11,7 @@ import re
 from abc import ABC, abstractmethod
 from typing import Optional
 
-from ..models import TableSchema, SchemaDiff, ToolResult, RestCheckerConfig, PostgresCheckerConfig
+from ..models import TableSchema, SchemaDiff, ToolResult, RestCheckerConfig, PostgresCheckerConfig, FileCheckerConfig, IcebergCheckerConfig
 
 
 class SchemaRegistry(ABC):
@@ -91,7 +91,7 @@ class SchemaRegistry(ABC):
     def register_checker(
         self,
         schema_name: str,
-        config: RestCheckerConfig | PostgresCheckerConfig,
+        config: RestCheckerConfig | PostgresCheckerConfig | FileCheckerConfig | IcebergCheckerConfig,
     ) -> ToolResult:
         """Store a checker config for the given schema."""
         ...

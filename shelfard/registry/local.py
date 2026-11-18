@@ -21,7 +21,7 @@ from typing import Optional
 
 from ..models import (
     ColumnSchema, TableSchema, ConsumerSubscription, SchemaDiff, ToolResult,
-    RestCheckerConfig, PostgresCheckerConfig,
+    RestCheckerConfig, PostgresCheckerConfig, FileCheckerConfig, IcebergCheckerConfig,
 )
 from .base import SchemaRegistry
 from ..security import ensure_within, query_template_error, validate_name, validate_var_name
@@ -365,7 +365,7 @@ class LocalFileRegistry(SchemaRegistry):
     def register_checker(
         self,
         schema_name: str,
-        config: RestCheckerConfig | PostgresCheckerConfig,
+        config: RestCheckerConfig | PostgresCheckerConfig | FileCheckerConfig | IcebergCheckerConfig,
     ) -> ToolResult:
         """Store a checker config. Always overwrites — checkers are not versioned."""
         if invalid := self._invalid_names(schema_name=schema_name):
@@ -418,6 +418,7 @@ class LocalFileRegistry(SchemaRegistry):
                     "checker_type": c.get("checker_type", "rest"),
                     "url": c.get("url", ""),       # rest checkers
                     "dsn": c.get("dsn", ""),       # postgres checkers
+                    "path": c.get("path", ""),     # file / iceberg checkers
                     "env": c.get("env", []),
                     "registered_at": c.get("registered_at"),
                     "registered_via": c.get("registered_via", "cli"),
@@ -443,6 +444,14 @@ class LocalFileRegistry(SchemaRegistry):
             from ..tools.postgres import PostgresChecker
             config = PostgresCheckerConfig.from_dict(config_dict)
             return PostgresChecker(config, self).run()
+        elif checker_type == "file":
+            from ..tools.files import FileChecker
+            config = FileCheckerConfig.from_dict(config_dict)
+            return FileChecker(config, self).run()
+        elif checker_type == "iceberg":
+            from ..tools.iceberg import IcebergChecker
+            config = IcebergCheckerConfig.from_dict(config_dict)
+            return IcebergChecker(config, self).run()
         else:
             return ToolResult(
                 success=False,

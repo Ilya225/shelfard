@@ -1,6 +1,6 @@
 # Shelfard
 
-Detect schema drift in REST APIs and databases. Know exactly what changes and who breaks.
+Detect schema drift in REST APIs, databases and data lake files (Parquet, ORC, Avro, Iceberg). Know exactly what changes and who breaks.
 
 Shelfard snapshots the structure of your data sources, classifies every change as SAFE, WARNING, or BREAKING, and tracks which downstream consumers are affected. Store check configurations once and run them from a CLI, a CI pipeline, an MCP-compatible client, or a conversational agent.
 
@@ -21,6 +21,9 @@ pip install shelfard
 
 # With PostgreSQL support (psycopg2-binary)
 pip install shelfard[postgres]
+
+# With Parquet / ORC support (pyarrow). Avro and Iceberg need no extra.
+pip install shelfard[files]
 ```
 
 ### Homebrew
@@ -209,6 +212,78 @@ shelfard postgres snapshot \
 
 ---
 
+## CLI — Parquet, ORC and Avro files
+
+`shelfard file` reads the schema of a local file or a directory of files (e.g. a
+Spark output folder or a Hive-partitioned dataset). Only metadata is read —
+Parquet/ORC footers, the Avro container header — never row data.
+
+```bash
+pip install shelfard[files]   # pyarrow, for Parquet / ORC; Avro needs nothing extra
+
+shelfard file snapshot data/orders_parquet --name orders          # format auto-detected
+shelfard file check    data/orders_parquet --name orders          # exit 1 on drift
+shelfard file snapshot events.avro --name events
+shelfard file snapshot schemas/event.avsc --name event_contract    # Avro schema file
+shelfard file list     data/                                       # find sources in a folder
+```
+
+Format detection: file extension → magic bytes. Force it with `--format parquet|orc|avro`.
+Iceberg tables are refused here (their data folders hold Parquet files) — use `shelfard iceberg`.
+
+| Format | What is read | Notes |
+|---|---|---|
+| Parquet | File footer (pyarrow) | REQUIRED/OPTIONAL → nullability. Directories: Hive `key=value` folders become `partition_keys` (their types are inferred from folder names, so dates show up as TEXT). |
+| ORC | File footer (pyarrow) | ORC has no nullability, so every column is nullable. |
+| Avro | Writer schema in the container header, or an `.avsc` file | `["null", T]` → nullable T. Directories: first data file's schema. `default` and `doc` are kept. |
+
+Paths may use `{{var}}` template variables and `$ENV_VARS`. Remote URIs
+(`s3://`, `gs://`, ...) are not supported yet.
+
+```bash
+shelfard var set lake /mnt/lake
+shelfard file snapshot '{{lake}}/orders' --name orders --create-checker
+shelfard checker run orders
+```
+
+---
+
+## CLI — Iceberg tables
+
+`shelfard iceberg` reads a table's current schema straight from its table
+metadata (`metadata/*.metadata.json`) — no catalog connection, JVM or extra
+dependency.
+
+```bash
+shelfard iceberg list     warehouse/                         # → db.orders, db.users, ...
+shelfard iceberg snapshot warehouse/db/orders --name orders  # --create-checker works too
+shelfard iceberg check    warehouse/db/orders --name orders  # exit 1 on drift
+
+# Baseline from an older commit, then compare against the current one
+shelfard iceberg snapshot warehouse/db/orders/metadata/v1.metadata.json --name orders
+shelfard iceberg check    warehouse/db/orders --name orders
+```
+
+- The current metadata file comes from `version-hint.text` (Hadoop catalog), otherwise the highest metadata version. Gzip-compressed metadata and format v1/v2/v3 are supported.
+- `required` → nullability, `doc` → description, `write-default` → default.
+- Partition spec → `partition_keys` (e.g. `day(created_at)`, `bucket[16](id)`); sort order → `clustering_keys`.
+- Catalog lookups (REST, Glue, Hive Metastore) and `s3://` paths are not supported yet.
+
+**Sample data.** `scripts/spark_fixtures.py` uses PySpark to write an `orders`
+table as Parquet, ORC and Avro in a baseline and a drifted version, plus an
+Iceberg table evolved with `ALTER TABLE`:
+
+```bash
+pip install pyspark==4.0.1       # needs Java 17 or 21
+python scripts/spark_fixtures.py --out sample_data
+shelfard file snapshot sample_data/v1/orders_parquet --name orders_pq
+shelfard file check    sample_data/v2/orders_parquet --name orders_pq   # 2 BREAKING, 2 SAFE
+shelfard iceberg snapshot sample_data/warehouse/db/orders/metadata/v1.metadata.json --name orders_ice
+shelfard iceberg check    sample_data/warehouse/db/orders --name orders_ice
+```
+
+---
+
 ## CLI — Inspect the registry
 
 ### Show a schema
@@ -334,6 +409,13 @@ shelfard checker register order_summary \
   --dsn 'postgresql://user:$PG_PASS@host/db' \
   --query 'SELECT o.id, o.total, u.email FROM orders o JOIN users u ON o.user_id = u.id' \
   --env PG_PASS
+```
+
+### File and Iceberg checkers
+
+```bash
+shelfard checker register events --type file --path '{{lake}}/events' --format avro
+shelfard checker register orders --type iceberg --path '{{lake}}/warehouse/db/orders'
 ```
 
 ### Run a checker

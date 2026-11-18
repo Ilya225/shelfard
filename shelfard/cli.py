@@ -4,6 +4,12 @@ Shelfard — schema drift detection CLI.
 Usage:
   shelfard rest snapshot <url> --name NAME [--bearer TOKEN] [--header KEY=VALUE ...]
   shelfard rest check    <url> --name NAME [--bearer TOKEN] [--header KEY=VALUE ...]
+  shelfard file snapshot <path> --name NAME [--format auto|parquet|orc|avro]
+  shelfard file check    <path> --name NAME [--format ...]
+  shelfard file list     <dir>
+  shelfard iceberg snapshot <table-path> --name NAME
+  shelfard iceberg check    <table-path> --name NAME
+  shelfard iceberg list     <warehouse-dir>
   shelfard show          <table>
   shelfard list          {schemas,subscriptions}
   shelfard subscribe     <table> --consumer NAME [--columns COL1,COL2,...]
@@ -12,6 +18,7 @@ Usage:
 """
 
 import argparse
+import os
 import re
 import sys
 
@@ -19,11 +26,12 @@ from shelfard import (
     ColumnSchema, RestEndpointReader, PostgresReader, TableSchema,
     compare_schemas_from_dicts, get_registered_schema, register_schema,
     get_all_schemas, get_all_consumers, subscribe_consumer,
-    RestCheckerConfig, PostgresCheckerConfig,
+    RestCheckerConfig, PostgresCheckerConfig, FileCheckerConfig, FileReader,
+    list_file_tables, IcebergCheckerConfig, IcebergReader, list_iceberg_tables,
     register_checker, get_checker, get_all_checkers, run_checker,
     set_var, get_var, list_vars, delete_var,
 )
-from shelfard.models import ChangeSeverity
+from shelfard.models import ChangeSeverity, ChangeType
 from shelfard.registry import _default as _registry
 from shelfard.security import query_template_error
 
@@ -103,7 +111,7 @@ def _print_diff(schema_name: str, diff: dict, baseline_version: str) -> None:
 
     for change in diff["changes"]:
         sev = change["severity"]
-        label = f"[{sev:<8}]"
+        label = f"[{ChangeSeverity(sev).value:<8}]"
         if sev == ChangeSeverity.BREAKING:
             label = red(label)
         elif sev == ChangeSeverity.WARNING:
@@ -111,7 +119,7 @@ def _print_diff(schema_name: str, diff: dict, baseline_version: str) -> None:
         else:
             label = green(label)
 
-        print(f"  {label} {change['change_type']:<25} '{change['column_name']}'")
+        print(f"  {label} {ChangeType(change['change_type']).value:<25} '{change['column_name']}'")
         print(f"             {change['reasoning']}")
         print()
 
@@ -332,6 +340,126 @@ def cmd_postgres_check(args) -> int:
     return 0 if not diff["changes"] else 1
 
 
+# ── File-format commands (Parquet / ORC / Avro) ───────────────────────────────
+
+def _resolve_file_path(raw: str) -> str:
+    """Resolve {{vars}} from the registry, then $VARS from the environment."""
+    path = _resolve_template_vars(raw)
+    for name in _extract_env_vars(path):
+        if name in os.environ:
+            path = path.replace(f"${name}", os.environ[name])
+    return path
+
+
+def _read_file_schema(args):
+    path = _resolve_file_path(args.path)
+    print(f"Reading {path} …")
+    if args.source == "iceberg":
+        result = IcebergReader(path, args.name).get_schema()
+    else:
+        result = FileReader(path, args.name, args.format).get_schema()
+    if not result.success:
+        print(red(f"✗ Failed to read schema: {result.error}"))
+        if result.next_action_hint:
+            print(f"  {result.next_action_hint}")
+    return result
+
+
+def cmd_file_snapshot(args) -> int:
+    schema_name = args.name
+    result = _read_file_schema(args)
+    if not result.success:
+        return 2
+
+    schema = _schema_from_result(result)
+    reg = register_schema(schema_name, schema)
+    if not reg.success:
+        print(red(f"✗ Failed to register schema: {reg.error}"))
+        return 2
+
+    version = reg.data["version_count"]
+    print(green(f"✓ Snapshot saved: '{schema_name}' (version {version}, {schema.source}, "
+                f"{len(schema.columns)} top-level columns)"))
+    if result.data.get("metadata_file"):
+        print(f"  metadata: {result.data['metadata_file']}")
+    if schema.partition_keys:
+        print(f"  partitioned by: {', '.join(schema.partition_keys)}")
+    if schema.clustering_keys:
+        print(f"  sorted by: {', '.join(schema.clustering_keys)}")
+
+    if getattr(args, "create_checker", False):
+        env = _extract_env_vars(args.path)
+        if args.source == "iceberg":
+            config = IcebergCheckerConfig(schema_name=schema_name, path=args.path, env=env)
+        else:
+            config = FileCheckerConfig(
+                schema_name=schema_name, path=args.path, env=env, file_format=args.format,
+            )
+        cr = register_checker(schema_name, config)
+        if cr.success:
+            print(green(f"✓ Checker registered for '{schema_name}'") + f"  ({config.checker_type})")
+        else:
+            print(yellow(f"⚠ Snapshot saved but checker registration failed: {cr.error}"))
+    return 0
+
+
+def cmd_file_check(args) -> int:
+    schema_name = args.name
+    new_result = _read_file_schema(args)
+    if not new_result.success:
+        return 2
+
+    baseline_result = get_registered_schema(schema_name)
+    if not baseline_result.success:
+        print(red(f"✗ No snapshot found for '{schema_name}'."))
+        print(f"  Run:  shelfard {args.source} snapshot {args.path} --name {schema_name}")
+        return 2
+
+    diff_result = compare_schemas_from_dicts(
+        baseline_result.data["schema"],
+        new_result.data["schema"],
+    )
+    if not diff_result.success:
+        print(red(f"✗ Comparison failed: {diff_result.error}"))
+        return 2
+
+    diff = diff_result.data["diff"]
+    _print_diff(schema_name, diff, baseline_result.data["version"])
+    return 0 if not diff["changes"] else 1
+
+
+def cmd_file_list(args) -> int:
+    result = list_file_tables(_resolve_file_path(args.path))
+    if not result.success:
+        print(red(f"✗ {result.error}"))
+        return 2
+    tables = result.data["tables"]
+    if not tables:
+        print("No Parquet, ORC or Avro sources found.")
+        return 0
+    print(f"\nSources ({len(tables)}):\n")
+    for t in tables:
+        print(f"  {t['name']:<30} {t['file_format']:<8} {t['path']}")
+    print()
+    return 0
+
+
+def cmd_iceberg_list(args) -> int:
+    result = list_iceberg_tables(_resolve_file_path(args.path))
+    if not result.success:
+        print(red(f"✗ {result.error}"))
+        return 2
+    tables = result.data["tables"]
+    if not tables:
+        print("No Iceberg tables found.")
+        return 0
+    print(f"\nIceberg tables ({len(tables)}):\n")
+    for t in tables:
+        print(f"  {t['name']:<30} {t['path']}")
+    print()
+    return 0
+
+
 # ── show command ──────────────────────────────────────────────────────────────
 
 def cmd_show(args) -> int:
@@ -478,6 +606,27 @@ def cmd_checker_register(args) -> int:
             sample_size=args.sample_size or 100,
         )
 
+    elif checker_type == "file":
+        if not args.path:
+            print(red("✗ --path is required for file checkers"))
+            return 2
+        config = FileCheckerConfig(
+            schema_name=args.schema_name,
+            path=args.path,
+            env=args.env or _extract_env_vars(args.path),
+            file_format=args.file_format or "auto",
+        )
+
+    elif checker_type == "iceberg":
+        if not args.path:
+            print(red("✗ --path is required for iceberg checkers"))
+            return 2
+        config = IcebergCheckerConfig(
+            schema_name=args.schema_name,
+            path=args.path,
+            env=args.env or _extract_env_vars(args.path),
+        )
+
     else:
         print(red(f"✗ Unknown checker type: {checker_type!r}"))
         return 2
@@ -504,6 +653,8 @@ def cmd_checker_run(args) -> int:
     if c.get("checker_type") == "postgres":
         target = c.get("table") or "(custom query)"
         print(f"Checking PostgreSQL '{target}' …")
+    elif c.get("checker_type") in ("file", "iceberg"):
+        print(f"Reading {c.get('path', '')} …")
     else:
         print(f"Fetching {c.get('url', '')} …")
 
@@ -538,6 +689,12 @@ def cmd_checker_show(args) -> int:
             print(f"  schema: {c['db_schema']}")
         if c.get("env"):
             print(f"  env:   {', '.join(c['env'])}")
+    elif checker_type in ("file", "iceberg"):
+        print(f"  path:   {c.get('path', '')}")
+        if checker_type == "file":
+            print(f"  format: {c.get('file_format', 'auto')}")
+        if c.get("env"):
+            print(f"  env:    {', '.join(c['env'])}")
     else:
         print(f"  url:   {c.get('url', '')}")
         if c.get("env"):
@@ -566,7 +723,7 @@ def cmd_checker_list(_args) -> int:
     print(f"\nCheckers ({len(checkers)}):\n")
     for c in checkers:
         env_str = ", ".join(c["env"]) if c.get("env") else "—"
-        target = c.get("url") or c.get("dsn") or "—"
+        target = c.get("url") or c.get("dsn") or c.get("path") or "—"
         print(
             f"  {c['schema_name']:<20} {c['checker_type']:<8} "
             f"{target:<45} {env_str:<20} {c.get('registered_at') or ''}"
@@ -721,6 +878,87 @@ def _add_postgres_subcommands(top) -> None:
     chk.set_defaults(func=cmd_postgres_check)
 
 
+_FILE_FORMAT_CHOICES = ["auto", "parquet", "orc", "avro"]
+
+
+def _add_file_subcommands(top) -> None:
+    file_p = top.add_parser("file", help="Parquet / ORC / Avro files and datasets")
+    file_cmds = file_p.add_subparsers(dest="command", required=True, metavar="COMMAND")
+
+    file_base = argparse.ArgumentParser(add_help=False)
+    file_base.add_argument(
+        "path",
+        help="File or directory of files (e.g. a partitioned dataset); "
+             "may contain {{var}} and $VAR placeholders",
+    )
+    file_base.add_argument(
+        "--name", metavar="NAME", required=True,
+        help="Schema name used to store and retrieve from the registry",
+    )
+    file_base.add_argument(
+        "--format", default="auto", choices=_FILE_FORMAT_CHOICES,
+        help="File format (default: auto-detect from extension or magic bytes)",
+    )
+    file_base.set_defaults(source="file")
+
+    snap = file_cmds.add_parser(
+        "snapshot", parents=[file_base],
+        help="Read a file's / table's schema and save it to the registry",
+    )
+    snap.add_argument(
+        "--create-checker", action="store_true", default=False,
+        help="Also register a checker config for the same path after snapshotting",
+    )
+    snap.set_defaults(func=cmd_file_snapshot)
+
+    chk = file_cmds.add_parser(
+        "check", parents=[file_base],
+        help="Read a file's / table's schema and compare it against the saved snapshot",
+    )
+    chk.set_defaults(func=cmd_file_check)
+
+    lst = file_cmds.add_parser("list", help="List Parquet / ORC / Avro sources in a directory")
+    lst.add_argument("path", help="Directory to scan (one level deep)")
+    lst.set_defaults(func=cmd_file_list)
+
+
+def _add_iceberg_subcommands(top) -> None:
+    ice_p = top.add_parser("iceberg", help="Apache Iceberg tables")
+    ice_cmds = ice_p.add_subparsers(dest="command", required=True, metavar="COMMAND")
+
+    ice_base = argparse.ArgumentParser(add_help=False)
+    ice_base.add_argument(
+        "path",
+        help="Table directory, its metadata/ directory, or a specific *.metadata.json "
+             "(snapshots that version); may contain {{var}} and $VAR placeholders",
+    )
+    ice_base.add_argument(
+        "--name", metavar="NAME", required=True,
+        help="Schema name used to store and retrieve from the registry",
+    )
+    ice_base.set_defaults(source="iceberg", format=None)
+
+    snap = ice_cmds.add_parser(
+        "snapshot", parents=[ice_base],
+        help="Read the table's current schema and save it to the registry",
+    )
+    snap.add_argument(
+        "--create-checker", action="store_true", default=False,
+        help="Also register a checker config for the same table path after snapshotting",
+    )
+    snap.set_defaults(func=cmd_file_snapshot)
+
+    chk = ice_cmds.add_parser(
+        "check", parents=[ice_base],
+        help="Read the table's current schema and compare it against the saved snapshot",
+    )
+    chk.set_defaults(func=cmd_file_check)
+
+    lst = ice_cmds.add_parser("list", help="Find Iceberg tables under a warehouse directory")
+    lst.add_argument("path", help="Warehouse directory (Hadoop-catalog layout)")
+    lst.set_defaults(func=cmd_iceberg_list)
+
+
 def _add_checker_subcommands(top) -> None:
     checker_p = top.add_parser("checker", help="Manage stored drift-check configurations")
     checker_cmds = checker_p.add_subparsers(dest="command", required=True, metavar="COMMAND")
@@ -731,7 +969,7 @@ def _add_checker_subcommands(top) -> None:
     )
     reg.add_argument("schema_name", help="Schema name to register a checker for")
     reg.add_argument(
-        "--type", dest="checker_type", default="rest", choices=["rest", "postgres"],
+        "--type", dest="checker_type", default="rest", choices=["rest", "postgres", "file", "iceberg"],
         help="Checker type (default: rest)",
     )
     # REST options
@@ -752,6 +990,12 @@ def _add_checker_subcommands(top) -> None:
                      help="[postgres] PostgreSQL schema namespace (default: public)")
     reg.add_argument("--sample-size", type=int, default=100,
                      help="[postgres] Rows to sample for nullability inference (default: 100)")
+    # File options
+    reg.add_argument("--path", default=None,
+                     help="[file/iceberg] File, dataset directory or Iceberg table path "
+                          "(may contain {{var}} / $VAR)")
+    reg.add_argument("--format", dest="file_format", default="auto", choices=_FILE_FORMAT_CHOICES,
+                     help="[file] File format (default: auto-detect)")
     # Common
     reg.add_argument(
         "--env", metavar="VAR", action="append", default=[],
@@ -811,6 +1055,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     _add_rest_subcommands(top)
     _add_postgres_subcommands(top)
+    _add_file_subcommands(top)
+    _add_iceberg_subcommands(top)
     _add_checker_subcommands(top)
     _add_var_subcommands(top)
 

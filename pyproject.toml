@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "shelfard"
 version = "0.1.0"
-description = "Schema drift detection for REST APIs and databases"
+description = "Schema drift detection for REST APIs, databases and data lake files"
 readme = "README.md"
 license = { file = "LICENSE" }
 requires-python = ">=3.12"
@@ -26,6 +26,8 @@ dependencies = [
 
 [project.optional-dependencies]
 postgres = ["psycopg2-binary>=2.9"]
+# Parquet and ORC (Avro and Iceberg are read with the stdlib)
+files = ["pyarrow>=18"]
 ollama = ["langchain-ollama>=1.0"]
 
 [project.urls]

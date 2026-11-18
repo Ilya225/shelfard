@@ -1,13 +1,15 @@
 from .models import (
     ColumnSchema, TableSchema, ColumnType,
     ChangeSeverity, ChangeType, SchemaDiff, ColumnChange, ToolResult,
-    ConsumerSubscription, RestCheckerConfig, PostgresCheckerConfig,
+    ConsumerSubscription, RestCheckerConfig, PostgresCheckerConfig, FileCheckerConfig, IcebergCheckerConfig,
 )
 from .tools import (
     SchemaReader, Checker,
     SQLiteReader, get_sqlite_schema, list_sqlite_tables,
     RestEndpointReader, get_rest_schema, RestChecker,
     PostgresReader, get_postgres_schema, list_postgres_tables, PostgresChecker,
+    FileReader, get_file_schema, list_file_tables, FileChecker,
+    IcebergReader, get_iceberg_schema, list_iceberg_tables, IcebergChecker,
 )
 from .parsers import get_schema_from_json, infer_schema_from_json_file, read_and_register_json_file
 from .registry import (

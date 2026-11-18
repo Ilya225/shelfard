@@ -286,6 +286,74 @@ class PostgresCheckerConfig:
         )
 
 
+@dataclass
+class FileCheckerConfig:
+    """Stored configuration for a file-format drift check (Parquet / ORC / Avro).
+
+    ``path`` is a local file or directory (e.g. a partitioned dataset). It may
+    contain ``{{var}}`` template variables and ``$VAR`` placeholders, resolved
+    at run time. ``file_format`` is one of ``auto``, ``parquet``, ``orc``, ``avro``.
+    """
+    schema_name: str
+    path: str
+    env: list[str] = field(default_factory=list)
+    file_format: str = "auto"
+    checker_type: str = "file"
+    registered_at: Optional[str] = None
+    registered_via: str = "cli"
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+    def to_json(self) -> str:
+        return json.dumps(self.to_dict(), indent=2, default=str)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "FileCheckerConfig":
+        return cls(
+            schema_name=d["schema_name"],
+            path=d["path"],
+            env=d.get("env", []),
+            file_format=d.get("file_format", "auto"),
+            checker_type=d.get("checker_type", "file"),
+            registered_at=d.get("registered_at"),
+            registered_via=d.get("registered_via", "cli"),
+        )
+
+
+@dataclass
+class IcebergCheckerConfig:
+    """Stored configuration for an Iceberg table drift check.
+
+    ``path`` is a local table directory, its ``metadata/`` directory, or a
+    ``*.metadata.json`` file. It may contain ``{{var}}`` template variables and
+    ``$VAR`` placeholders, resolved at run time.
+    """
+    schema_name: str
+    path: str
+    env: list[str] = field(default_factory=list)
+    checker_type: str = "iceberg"
+    registered_at: Optional[str] = None
+    registered_via: str = "cli"
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+    def to_json(self) -> str:
+        return json.dumps(self.to_dict(), indent=2, default=str)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "IcebergCheckerConfig":
+        return cls(
+            schema_name=d["schema_name"],
+            path=d["path"],
+            env=d.get("env", []),
+            checker_type=d.get("checker_type", "iceberg"),
+            registered_at=d.get("registered_at"),
+            registered_via=d.get("registered_via", "cli"),
+        )
+
+
 # ─────────────────────────────────────────────
 # Tool result wrapper
 # ─────────────────────────────────────────────
