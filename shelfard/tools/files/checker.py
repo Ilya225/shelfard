@@ -57,6 +57,7 @@ class FileChecker(Checker):
             data={
                 "schema_name": self.config.schema_name,
                 "baseline_version": baseline.data["version"],
+                "baseline_version_number": baseline.data.get("version_number"),
                 "diff": diff.data["diff"],
             },
         )

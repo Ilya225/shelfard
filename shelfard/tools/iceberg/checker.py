@@ -56,6 +56,7 @@ class IcebergChecker(Checker):
             data={
                 "schema_name": self.config.schema_name,
                 "baseline_version": baseline.data["version"],
+                "baseline_version_number": baseline.data.get("version_number"),
                 "metadata_file": live.data["metadata_file"],
                 "diff": diff.data["diff"],
             },

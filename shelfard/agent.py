@@ -52,7 +52,10 @@ _OLLAMA_NUM_CTX    = 8192
 DEFAULT_MODEL_ENV  = "SHELFARD_DEFAULT_MODEL"
 
 #: Tools that change registry state; each call needs explicit user approval.
-WRITE_TOOLS = ("register_checker", "register_postgres_checker", "set_template_var", "delete_template_var")
+WRITE_TOOLS = (
+    "register_checker", "register_postgres_checker", "set_template_var", "delete_template_var",
+    "accept_safe_schema_update",
+)
 
 #: Env vars never forwarded to the MCP subprocess, even if a checker declares them.
 _NEVER_FORWARD = frozenset({
@@ -74,13 +77,15 @@ _READ_TOOLS_DOC = """\
 - get_subscriptions — list all consumer subscriptions
 - get_subscription(consumer_name, table_name) — inspect a specific subscription
 - get_checker_config(schema_name) — show a registered checker
-- live_check_schema(schema_name) — run a registered checker against the live source
+- live_check_schema(schema_name) — run a registered checker against the live source; when every
+  change is SAFE the result has a suggested_update — explain it and offer to apply it
 - list_template_vars / get_template_var(name) — inspect stored template variables"""
 
 _WRITE_TOOLS_DOC = """
 - register_checker(...) — register a NEW REST checker (public hosts, SHELFARD_* env vars only)
 - register_postgres_checker(...) — register a NEW PostgreSQL checker (table mode, public hosts)
 - set_template_var(name, value) / delete_template_var(name) — manage template variables
+- accept_safe_schema_update(schema_name) — save the suggested baseline after an all-SAFE check
 Only call these write tools when the user explicitly asks for that change in this conversation.
 The user is asked to approve every write tool call before it runs."""
 

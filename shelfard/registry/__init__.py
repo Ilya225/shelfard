@@ -44,6 +44,7 @@ __all__ = [
     "list_vars",
     "delete_var",
     "resolve_template",
+    "accept_safe_update",
 ]
 
 # ── Default instance ──────────────────────────────────────────────────────────
@@ -70,3 +71,4 @@ get_var                      = _default.get_var
 list_vars                    = _default.list_vars
 delete_var                   = _default.delete_var
 resolve_template             = _default.resolve_template
+accept_safe_update           = _default.accept_safe_update

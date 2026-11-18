@@ -15,6 +15,7 @@ Each JSON file stores: {"table_name": "...", "versions": [...]}
 from __future__ import annotations
 
 import json
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -126,16 +127,17 @@ class LocalFileRegistry(SchemaRegistry):
         try:
             registry_data = self._load_json(path)
 
+            versions = registry_data["versions"]
             if version == "latest":
-                entry = registry_data["versions"][-1]
+                index = len(versions) - 1
             else:
-                matches = [v for v in registry_data["versions"] if v["captured_at"] == version]
-                if not matches:
+                index = next((i for i, v in enumerate(versions) if v["captured_at"] == version), None)
+                if index is None:
                     return ToolResult(
                         success=False,
                         error=f"Version '{version}' not found for table '{table_name}'.",
                     )
-                entry = matches[0]
+            entry = versions[index]
 
             columns = [ColumnSchema.from_dict(col) for col in entry["columns"]]
             schema = TableSchema(
@@ -149,7 +151,8 @@ class LocalFileRegistry(SchemaRegistry):
 
             return ToolResult(
                 success=True,
-                data={"schema": schema.to_dict(), "version": entry["captured_at"]},
+                data={"schema": schema.to_dict(), "version": entry["captured_at"],
+                      "version_number": index + 1, "version_count": len(versions)},
                 next_action_hint="Use compare_schemas() to diff this against an incoming schema.",
             )
         except Exception as e:
@@ -532,7 +535,8 @@ class LocalFileRegistry(SchemaRegistry):
             return ToolResult(success=True, data={"affected": []})
 
         # Collect top-level changed column names (strip nested qualifiers)
-        changed_cols = {c.column_name.split(".")[0] for c in diff.changes}
+        def _top(name: str) -> str:
+            return re.split(r"[.\[]", name, maxsplit=1)[0]
 
         affected = []
         for entry in consumers_result.data["consumers"]:
@@ -544,7 +548,7 @@ class LocalFileRegistry(SchemaRegistry):
                 subscribed_set = set(subscribed)
                 impacted = [
                     c.to_dict() for c in diff.changes
-                    if c.column_name.split(".")[0] in subscribed_set
+                    if _top(c.column_name) in subscribed_set
                 ]
 
             if impacted:

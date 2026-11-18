@@ -3,12 +3,12 @@ Shelfard — schema drift detection CLI.
 
 Usage:
   shelfard rest snapshot <url> --name NAME [--bearer TOKEN] [--header KEY=VALUE ...]
-  shelfard rest check    <url> --name NAME [--bearer TOKEN] [--header KEY=VALUE ...]
+  shelfard rest check    <url> --name NAME [--bearer TOKEN] [--header KEY=VALUE ...] [--update]
   shelfard file snapshot <path> --name NAME [--format auto|parquet|orc|avro]
-  shelfard file check    <path> --name NAME [--format ...]
+  shelfard file check    <path> --name NAME [--format ...] [--update]
   shelfard file list     <dir>
   shelfard iceberg snapshot <table-path> --name NAME
-  shelfard iceberg check    <table-path> --name NAME
+  shelfard iceberg check    <table-path> --name NAME [--update]
   shelfard iceberg list     <warehouse-dir>
   shelfard show          <table>
   shelfard list          {schemas,subscriptions}
@@ -29,7 +29,7 @@ from shelfard import (
     RestCheckerConfig, PostgresCheckerConfig, FileCheckerConfig, FileReader,
     list_file_tables, IcebergCheckerConfig, IcebergReader, list_iceberg_tables,
     register_checker, get_checker, get_all_checkers, run_checker,
-    set_var, get_var, list_vars, delete_var,
+    set_var, get_var, list_vars, delete_var, accept_safe_update,
 )
 from shelfard.models import ChangeSeverity, ChangeType
 from shelfard.registry import _default as _registry
@@ -102,10 +102,12 @@ def _print_diff(schema_name: str, diff: dict, baseline_version: str) -> None:
         return
 
     severity = diff["overall_severity"]
-    icon = "✗" if severity == ChangeSeverity.BREAKING else "⚠"
-    header_fn = red if severity == ChangeSeverity.BREAKING else yellow
-
-    print(header_fn(f"{icon} Schema drift detected for '{schema_name}'"))
+    if severity == ChangeSeverity.SAFE:
+        print(green(f"✓ Safe schema changes for '{schema_name}'"))
+    else:
+        icon = "✗" if severity == ChangeSeverity.BREAKING else "⚠"
+        header_fn = red if severity == ChangeSeverity.BREAKING else yellow
+        print(header_fn(f"{icon} Schema drift detected for '{schema_name}'"))
     print(f"  {diff['summary']}")
     print()
 
@@ -122,6 +124,40 @@ def _print_diff(schema_name: str, diff: dict, baseline_version: str) -> None:
         print(f"  {label} {ChangeType(change['change_type']).value:<25} '{change['column_name']}'")
         print(f"             {change['reasoning']}")
         print()
+
+
+def _finish_check(schema_name: str, diff: dict, baseline: dict, update: bool) -> int:
+    """Print the diff and, when every change is SAFE, the suggested baseline
+    update — applying it if ``update`` is set. ``baseline`` is the data of a
+    get_registered_schema() result (or a checker result's baseline fields).
+
+    Exit codes: 0 no drift or update applied, 1 drift, 2 update failed.
+    """
+    _print_diff(schema_name, diff, baseline["version"])
+    if not diff["changes"]:
+        return 0
+    suggestion = diff.get("suggested_update")
+    if not suggestion:
+        if update:
+            print(yellow("  --update ignored: only all-SAFE changes are applied automatically. "
+                         "Review the changes, then re-snapshot to accept them."))
+        return 1
+
+    current = baseline.get("version_number")
+    target = f"version {current} → {current + 1}" if current else "a new version"
+    print(f"  Suggested baseline update ({target}):")
+    for line in suggestion.get("explanation", []):
+        print(f"    • {line}")
+    if not update:
+        print("  Run the same command with --update to save it.")
+        return 1
+
+    result = accept_safe_update(schema_name, diff, baseline["version"])
+    if not result.success:
+        print(red(f"✗ Baseline not updated: {result.error}"))
+        return 2
+    print(green(f"✓ Baseline updated: '{schema_name}' is now version {result.data['version_count']}"))
+    return 0
 
 
 def _print_schema(schema_dict: dict, indent: int = 0) -> None:
@@ -228,9 +264,8 @@ def cmd_rest_check(args) -> int:
         print(red(f"✗ Comparison failed: {diff_result.error}"))
         return 2
 
-    diff = diff_result.data["diff"]
-    _print_diff(schema_name, diff, baseline_result.data["version"])
-    return 0 if not diff["changes"] else 1
+    return _finish_check(schema_name, diff_result.data["diff"], baseline_result.data,
+                         getattr(args, "update", False))
 
 
 # ── PostgreSQL commands ───────────────────────────────────────────────────────
@@ -335,9 +370,8 @@ def cmd_postgres_check(args) -> int:
         print(red(f"✗ Comparison failed: {diff_result.error}"))
         return 2
 
-    diff = diff_result.data["diff"]
-    _print_diff(schema_name, diff, baseline_result.data["version"])
-    return 0 if not diff["changes"] else 1
+    return _finish_check(schema_name, diff_result.data["diff"], baseline_result.data,
+                         getattr(args, "update", False))
 
 
 # ── File-format commands (Parquet / ORC / Avro) ───────────────────────────────
@@ -423,9 +457,8 @@ def cmd_file_check(args) -> int:
         print(red(f"✗ Comparison failed: {diff_result.error}"))
         return 2
 
-    diff = diff_result.data["diff"]
-    _print_diff(schema_name, diff, baseline_result.data["version"])
-    return 0 if not diff["changes"] else 1
+    return _finish_check(schema_name, diff_result.data["diff"], baseline_result.data,
+                         getattr(args, "update", False))
 
 
 def cmd_file_list(args) -> int:
@@ -663,9 +696,9 @@ def cmd_checker_run(args) -> int:
         print(red(f"✗ {result.error}"))
         return 2
 
-    diff = result.data["diff"]
-    _print_diff(args.schema_name, diff, result.data["baseline_version"])
-    return 0 if not diff["changes"] else 1
+    baseline = {"version": result.data["baseline_version"],
+                "version_number": result.data.get("baseline_version_number")}
+    return _finish_check(args.schema_name, result.data["diff"], baseline, args.update)
 
 
 def cmd_checker_show(args) -> int:
@@ -831,6 +864,10 @@ def _add_rest_subcommands(top) -> None:
         "check", parents=[rest_base],
         help="Fetch the endpoint and compare its schema against the saved snapshot",
     )
+    chk.add_argument(
+        "--update", action="store_true",
+        help="If every change is SAFE, save the suggested schema as the next baseline version",
+    )
     chk.set_defaults(func=cmd_rest_check)
 
 
@@ -875,6 +912,10 @@ def _add_postgres_subcommands(top) -> None:
         "check", parents=[pg_base],
         help="Read a PostgreSQL table or query and compare against the saved snapshot",
     )
+    chk.add_argument(
+        "--update", action="store_true",
+        help="If every change is SAFE, save the suggested schema as the next baseline version",
+    )
     chk.set_defaults(func=cmd_postgres_check)
 
 
@@ -915,6 +956,10 @@ def _add_file_subcommands(top) -> None:
         "check", parents=[file_base],
         help="Read a file's / table's schema and compare it against the saved snapshot",
     )
+    chk.add_argument(
+        "--update", action="store_true",
+        help="If every change is SAFE, save the suggested schema as the next baseline version",
+    )
     chk.set_defaults(func=cmd_file_check)
 
     lst = file_cmds.add_parser("list", help="List Parquet / ORC / Avro sources in a directory")
@@ -951,6 +996,10 @@ def _add_iceberg_subcommands(top) -> None:
     chk = ice_cmds.add_parser(
         "check", parents=[ice_base],
         help="Read the table's current schema and compare it against the saved snapshot",
+    )
+    chk.add_argument(
+        "--update", action="store_true",
+        help="If every change is SAFE, save the suggested schema as the next baseline version",
     )
     chk.set_defaults(func=cmd_file_check)
 
@@ -1005,6 +1054,10 @@ def _add_checker_subcommands(top) -> None:
 
     run = checker_cmds.add_parser("run", help="Run the registered checker for a schema")
     run.add_argument("schema_name", help="Schema name whose checker to run")
+    run.add_argument(
+        "--update", action="store_true",
+        help="If every change is SAFE, save the suggested schema as the next baseline version",
+    )
     run.set_defaults(func=cmd_checker_run)
 
     show = checker_cmds.add_parser("show", help="Display the registered checker config")

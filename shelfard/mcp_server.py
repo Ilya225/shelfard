@@ -22,7 +22,8 @@ Tool inputs come from an LLM, and the LLM reads untrusted data (e.g. field names
 returned by remote APIs), so every tool input is treated as attacker-controlled:
 
 * Write tools (``register_checker``, ``register_postgres_checker``,
-  ``set_template_var``, ``delete_template_var``) are only exposed with
+  ``set_template_var``, ``delete_template_var``, ``accept_safe_schema_update``)
+  are only exposed with
   ``--allow-writes`` (or ``SHELFARD_MCP_ALLOW_WRITES=1``).
 * Checkers registered through MCP may only reference env vars prefixed with
   ``SHELFARD_`` or listed in ``SHELFARD_MCP_ENV_ALLOWLIST``, may only target public
@@ -31,6 +32,9 @@ returned by remote APIs), so every tool input is treated as attacker-controlled:
   they run: REST connections are verified on the connected socket (incl. redirects) and
   PostgreSQL connections are pinned to a validated IP (DNS-rebinding guard).
 * PostgreSQL checkers registered through MCP are table-mode only (no custom SQL).
+* ``accept_safe_schema_update`` takes only a schema name: it re-runs the stored
+  checker server-side and registers the suggested baseline only if every change is
+  SAFE, so the LLM can never supply schema content.
 * Template variables referenced by an existing checker cannot be changed through
   MCP, so a stored checker (and its credentials) cannot be redirected.
 * All names used in file paths are validated by the registry (path-traversal guard).
@@ -59,6 +63,7 @@ from .registry import (
     get_var as _get_var,
     list_vars as _list_vars,
     delete_var as _delete_var,
+    accept_safe_update as _accept_safe_update,
 )
 from .models import ToolResult
 from .security import (
@@ -115,7 +120,9 @@ def get_checker_config(schema_name: str) -> str:
 
 
 def live_check_schema(schema_name: str) -> str:
-    """Run the registered checker for a schema against the live endpoint and return the drift result."""
+    """Run the registered checker for a schema against the live endpoint and return the drift result.
+    When every change is SAFE, the diff includes suggested_update (explanation + next baseline);
+    it is applied only through accept_safe_schema_update."""
     return _run_checker(schema_name).to_json()
 
 
@@ -291,11 +298,25 @@ def delete_template_var(name: str) -> str:
     return _delete_var(name).to_json()
 
 
+def accept_safe_schema_update(schema_name: str) -> str:
+    """Re-run the registered checker for a schema and, only if every change is SAFE, save the
+    suggested schema as the next baseline version. WARNING/BREAKING drift is never applied."""
+    check = _run_checker(schema_name)
+    if not check.success:
+        return check.to_json()
+    return _accept_safe_update(
+        schema_name, check.data["diff"], check.data["baseline_version"]
+    ).to_json()
+
+
 READ_TOOLS = (
     get_schema, get_schemas, get_subscriptions, get_subscription,
     get_checker_config, live_check_schema, get_template_var, list_template_vars,
 )
-WRITE_TOOLS = (register_checker, register_postgres_checker, set_template_var, delete_template_var)
+WRITE_TOOLS = (
+    register_checker, register_postgres_checker, set_template_var, delete_template_var,
+    accept_safe_schema_update,
+)
 
 
 def build_server(allow_writes: bool = False) -> FastMCP:

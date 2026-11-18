@@ -170,6 +170,43 @@ class SchemaRegistry(ABC):
             return result.data["value"] if result.success else match.group(0)
         return re.sub(r"\{\{([a-zA-Z_][a-zA-Z0-9_]*)\}\}", _replace, template)
 
+    # ── Baseline updates ──────────────────────────────────────────────────────
+
+    def accept_safe_update(self, table_name: str, diff: dict, baseline_version: str) -> ToolResult:
+        """
+        Register a diff's ``suggested_update`` schema as the next baseline version.
+
+        ``diff`` is a serialized SchemaDiff from ``compare_schemas`` (or a checker
+        run). It only carries a suggested update when every change is SAFE.
+        Refuses if the latest registered version is no longer ``baseline_version``
+        (someone re-snapshotted since the check), so a stale suggestion can't
+        overwrite newer history. Concrete: works for any backend.
+        """
+        update = (diff or {}).get("suggested_update")
+        if not update:
+            return ToolResult(
+                success=False,
+                error="No safe update to apply: the check found no changes, or some "
+                      "changes are WARNING/BREAKING and need review.",
+            )
+        latest = self.get_registered_schema(table_name)
+        if not latest.success:
+            return latest
+        if latest.data["version"] != baseline_version:
+            return ToolResult(
+                success=False,
+                error=f"Baseline for '{table_name}' changed since this check "
+                      f"(expected {baseline_version}, found {latest.data['version']}). Run the check again.",
+            )
+        result = self.register_schema(table_name, TableSchema.from_dict(update["schema"]))
+        if result.success:
+            result.data["explanation"] = update.get("explanation", [])
+            result.next_action_hint = (
+                f"Baseline updated to version {result.data['version_count']}. "
+                "Future checks compare against it."
+            )
+        return result
+
     # ── Impact analysis ───────────────────────────────────────────────────────
 
     @abstractmethod

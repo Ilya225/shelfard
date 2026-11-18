@@ -44,6 +44,7 @@ class ColumnSchema:
     default_value: Optional[str] = None
     description: Optional[str] = None
     fields: Optional[list[ColumnSchema]] = field(default=None)  # sub-fields for STRUCT columns
+    items: Optional[ColumnSchema] = None   # element schema for ARRAY columns (None = not recorded)
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -57,7 +58,8 @@ class ColumnSchema:
             self.max_length == other.max_length and
             self.precision == other.precision and
             self.scale == other.scale and
-            self.fields == other.fields
+            self.fields == other.fields and
+            self.items == other.items
         )
 
     @classmethod
@@ -72,6 +74,9 @@ class ColumnSchema:
         nested = None
         if col_type == ColumnType.STRUCT and col.get("fields"):
             nested = [cls.from_dict(f) for f in col["fields"]]
+        items = None
+        if col_type == ColumnType.ARRAY and col.get("items"):
+            items = cls.from_dict(col["items"])
 
         return cls(
             name=col["name"],
@@ -83,6 +88,7 @@ class ColumnSchema:
             default_value=col.get("default_value"),
             description=col.get("description"),
             fields=nested,
+            items=items,
         )
 
 
@@ -94,6 +100,17 @@ class TableSchema:
     clustering_keys: list[str] = field(default_factory=list)
     source: str = "unknown"          # "sqlite", "snowflake", "bigquery", etc.
     captured_at: Optional[str] = None
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "TableSchema":
+        return cls(
+            table_name=d["table_name"],
+            columns=[ColumnSchema.from_dict(c) for c in d.get("columns", [])],
+            partition_keys=list(d.get("partition_keys") or []),
+            clustering_keys=list(d.get("clustering_keys") or []),
+            source=d.get("source", "unknown"),
+            captured_at=d.get("captured_at"),
+        )
 
     def column_map(self) -> dict[str, ColumnSchema]:
         return {col.name: col for col in self.columns}
@@ -164,6 +181,9 @@ class ChangeType(str, Enum):
     NULLABILITY_TIGHTENED = "nullability_tightened" # NULL → NOT NULL — breaking if data exists
     DEFAULT_CHANGED     = "default_changed"
     COLUMN_REORDERED    = "column_reordered"   # safe for named access, breaking for positional
+    TYPE_RESOLVED       = "type_resolved"      # UNKNOWN → concrete type (e.g. a field first seen as null)
+    PARTITION_CHANGED   = "partition_changed"  # partition keys / transforms changed
+    CLUSTERING_CHANGED  = "clustering_changed" # clustering / sort keys changed
 
 
 @dataclass
@@ -187,6 +207,9 @@ class SchemaDiff:
     changes: list[ColumnChange]
     overall_severity: ChangeSeverity = ChangeSeverity.SAFE
     summary: str = ""
+    # Present when every change is SAFE: the explanation of each change and the
+    # schema to register as the next baseline version (see schema_comparison).
+    suggested_update: Optional[dict] = None
 
     @property
     def has_changes(self) -> bool:

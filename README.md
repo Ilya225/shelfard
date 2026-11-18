@@ -99,8 +99,38 @@ Fetching https://api.example.com/users/1 …
                email (varchar) was removed. All consumers reading this column will fail.
 
   [SAFE     ] column_added            'email_address'
-               email_address (varchar) was added. Nullable — existing queries unaffected.
+               email_address (varchar) was added. New field in the payload — existing readers are unaffected.
 ```
+
+**Only safe changes — update suggested:**
+
+When every change is SAFE, the check explains what a new baseline would record and offers to save it. Add `--update` (works on every `check` command and on `checker run`) to register it as the next version:
+
+```
+$ shelfard rest check https://api.example.com/users/1 --name users
+✓ Safe schema changes for 'users'
+  2 change(s) detected: 2 safe.
+
+  [SAFE    ] column_added              'email'
+             Column 'email' (varchar) was added. New field in the payload — existing readers are unaffected.
+
+  [SAFE    ] type_resolved             'name'
+             'name' had an unknown type (no value was observed when the baseline was captured — null or an
+             empty array); it is now varchar. Suggest recording varchar as its type in the next baseline version.
+
+  Suggested baseline update (version 1 → 2):
+    • add 'email' (varchar)
+    • set the type of 'name' to varchar (was unknown)
+  Run the same command with --update to save it.
+
+$ shelfard rest check https://api.example.com/users/1 --name users --update
+  …
+✓ Baseline updated: 'users' is now version 2
+```
+
+`--update` never applies WARNING or BREAKING drift — review those and re-snapshot to accept them. The update is refused if someone re-snapshotted since the check ran.
+
+**REST / JSON payloads are samples.** A schema inferred from one response says what that response looked like, so for these sources: a `null` value doesn't erase a known type (the baseline keeps it and marks the field nullable); a field that happens to be non-null isn't treated as NOT NULL; new fields are SAFE; key order is ignored; and array element types are tracked (`tags[]`, `tags[].x`).
 
 ### Authentication
 
@@ -116,7 +146,7 @@ shelfard rest snapshot <url> --name <name> --header X-Api-Key=abc --header X-Ten
 
 | Code | Meaning |
 |------|---------|
-| `0`  | Success — no drift detected (check) or snapshot saved (snapshot) |
+| `0`  | Success — no drift detected or `--update` applied (check) or snapshot saved (snapshot) |
 | `1`  | Drift detected |
 | `2`  | Error — network failure, missing snapshot, parse error |
 
@@ -614,7 +644,7 @@ Agent: The posts schema has 4 columns:
 You: exit
 ```
 
-The agent has access to the Shelfard MCP read tools — `get_schemas`, `get_schema` (includes checker info), `get_subscriptions`, `get_subscription`, `get_checker_config`, `live_check_schema`, `get_template_var`, `list_template_vars` — plus, with `--allow-writes`, `register_checker`, `register_postgres_checker`, `set_template_var`, and `delete_template_var`.
+The agent has access to the Shelfard MCP read tools — `get_schemas`, `get_schema` (includes checker info), `get_subscriptions`, `get_subscription`, `get_checker_config`, `live_check_schema`, `get_template_var`, `list_template_vars` — plus, with `--allow-writes`, `register_checker`, `register_postgres_checker`, `set_template_var`, `delete_template_var`, and `accept_safe_schema_update`.
 
 ---
 
@@ -640,7 +670,8 @@ The server runs over **stdio** (the MCP standard for local tools). It exposes ei
 | ✎ `register_checker(schema_name, url, env, headers)` | Register a **new** REST checker config for a schema (see [Security](#security)) |
 | ✎ `register_postgres_checker(schema_name, dsn, table, db_schema, env)` | Register a **new** PostgreSQL checker (table mode only — no custom SQL) |
 | `get_checker_config(schema_name)` | Retrieve the stored checker config (url, env vars, headers) |
-| `live_check_schema(schema_name)` | Run the registered checker against the live endpoint and return the drift result |
+| `live_check_schema(schema_name)` | Run the registered checker against the live endpoint and return the drift result (with `suggested_update` when every change is SAFE) |
+| ✎ `accept_safe_schema_update(schema_name)` | Re-run the checker and, only if every change is SAFE, save the suggested schema as the next baseline version |
 | ✎ `set_template_var(name, value)` | Store a named template variable for use as `{{name}}` in checker configs and snapshot commands |
 | `get_template_var(name)` | Retrieve a stored template variable by name |
 | `list_template_vars()` | List all stored template variables and their values |
@@ -671,7 +702,7 @@ Point your MCP client at `shelfard mcp` with stdio transport. The server reads f
 
 MCP tool inputs come from an LLM, and the LLM reads data that third parties control (field names returned by a REST API, for example). A prompt injection could otherwise trick it into sending your secrets to an attacker's URL, or writing files outside the registry. The server therefore treats every tool input as untrusted:
 
-- **Write tools are off by default.** `register_checker`, `register_postgres_checker`, `set_template_var`, and `delete_template_var` are only exposed with `--allow-writes`. In `shelfard agent`, each write call also needs your interactive approval.
+- **Write tools are off by default.** `register_checker`, `register_postgres_checker`, `set_template_var`, `delete_template_var`, and `accept_safe_schema_update` are only exposed with `--allow-writes`. In `shelfard agent`, each write call also needs your interactive approval.
 - **Env-var allowlist.** Checkers registered via MCP may only reference env vars prefixed with `SHELFARD_` or listed in `SHELFARD_MCP_ENV_ALLOWLIST` (comma-separated). `$ANTHROPIC_API_KEY`, `$AWS_SECRET_ACCESS_KEY`, etc. are rejected. Every `$VAR` in the URL/headers/DSN must be declared in `env`.
 - **Internal-address (SSRF) guard.** Checkers registered via MCP must target public hosts — loopback, private, link-local (e.g. `169.254.169.254` cloud metadata), and reserved ranges are rejected. This is checked at registration **and again every time the checker runs**:
   - REST: the address of every TCP connection is verified on the connected socket, including each redirect hop, so DNS rebinding (a name that resolves somewhere else later) is caught.

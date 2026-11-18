@@ -42,10 +42,21 @@ def _infer_column_type(value) -> ColumnType:
 
 
 def _build_column_schema(key: str, value) -> ColumnSchema:
-    """Build a ColumnSchema for a single key/value pair, recursing into dicts as STRUCT."""
+    """Build a ColumnSchema for a single key/value pair.
+
+    Nested dicts become STRUCT columns; lists become ARRAY columns whose
+    ``items`` schema is inferred from the first non-null element (UNKNOWN if
+    the list is empty or all-null). A null value is UNKNOWN and nullable —
+    it only says the value was null in this sample, not what its type is.
+    """
     if isinstance(value, dict):
         nested = [_build_column_schema(k, v) for k, v in value.items()]
         return ColumnSchema(name=key, col_type=ColumnType.STRUCT, nullable=False, fields=nested)
+    if isinstance(value, list):
+        sample = next((v for v in value if v is not None), None)
+        items = _build_column_schema("item", sample)
+        items.nullable = any(v is None for v in value)  # an empty list says nothing
+        return ColumnSchema(name=key, col_type=ColumnType.ARRAY, nullable=False, items=items)
     return ColumnSchema(name=key, col_type=_infer_column_type(value), nullable=(value is None))
 
 

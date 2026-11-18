@@ -42,7 +42,8 @@ class Checker(ABC):
 
         Returns ToolResult with data={
             "schema_name": str,
-            "baseline_version": str,
-            "diff": dict,       # SchemaDiff serialized
+            "baseline_version": str,          # captured_at of the baseline
+            "baseline_version_number": int,   # 1-based position in the history
+            "diff": dict,       # SchemaDiff serialized; includes suggested_update when all SAFE
         }
         """

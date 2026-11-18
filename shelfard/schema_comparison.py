@@ -10,6 +10,8 @@ The output SchemaDiff is designed to be:
 3. Actionable — severity is pre-classified so the agent can route appropriately
 """
 
+from dataclasses import replace
+
 from .models import (
     ColumnSchema, TableSchema, SchemaDiff, ColumnChange,
     ChangeType, ChangeSeverity, ToolResult, ColumnType
@@ -19,16 +21,35 @@ from .parsers.json_reader import get_schema_from_json
 
 
 # ─────────────────────────────────────────────
+# Sampled sources
+# Schemas inferred from example payloads (REST responses, JSON files) say
+# what one sample looked like, not what the source guarantees:
+#   * a null value is inferred as UNKNOWN — the type simply wasn't observed;
+#   * a non-null value is inferred as NOT NULL — absence of nulls proves nothing;
+#   * a new field can't break a reader, and JSON key order is meaningless.
+# ─────────────────────────────────────────────
+
+SAMPLED_SOURCES = frozenset({"rest_api", "json_file"})
+
+
+def _is_sampled(old_schema: TableSchema, new_schema: TableSchema) -> bool:
+    return old_schema.source in SAMPLED_SOURCES or new_schema.source in SAMPLED_SOURCES
+
+
+# ─────────────────────────────────────────────
 # Severity classification rules
 # These are deterministic rules that avoid wasting LLM tokens
 # on clear-cut cases. The LLM reasons about ambiguous ones.
 # ─────────────────────────────────────────────
 
-def _classify_added_column(col: ColumnSchema) -> ChangeSeverity:
+def _classify_added_column(col: ColumnSchema, sampled: bool = False) -> ChangeSeverity:
     """
     Adding a column is SAFE if nullable or has a default.
     BREAKING if NOT NULL with no default — existing rows can't satisfy it.
+    For sampled (read-only payload) sources an extra field is always SAFE.
     """
+    if sampled:
+        return ChangeSeverity.SAFE
     if not col.nullable and col.default_value is None:
         return ChangeSeverity.BREAKING
     return ChangeSeverity.SAFE
@@ -37,6 +58,59 @@ def _classify_added_column(col: ColumnSchema) -> ChangeSeverity:
 def _classify_removed_column(col: ColumnSchema) -> ChangeSeverity:
     """Removing any column is always BREAKING — downstream SELECT * or named access fails."""
     return ChangeSeverity.BREAKING
+
+
+def _length(col: ColumnSchema) -> int | None:
+    """VARCHAR length; None (or a legacy 0) means unbounded."""
+    return col.max_length or None
+
+
+def _varchar(n: int | None) -> str:
+    return f"VARCHAR({n})" if n else "unbounded VARCHAR"
+
+
+def _classify_varchar_change(old_col, new_col):
+    old_len, new_len = _length(old_col), _length(new_col)
+    if new_len is None or (old_len is not None and new_len > old_len):
+        return (
+            ChangeType.TYPE_WIDENED,
+            ChangeSeverity.SAFE,
+            f"{_varchar(old_len)} → {_varchar(new_len)} — safe widening.",
+        )
+    return (
+        ChangeType.TYPE_CHANGED,
+        ChangeSeverity.BREAKING,
+        f"{_varchar(old_len)} → {_varchar(new_len)} — narrowing; existing values longer "
+        f"than {new_len} characters may be rejected or truncated.",
+    )
+
+
+def _decimal(p, s) -> str:
+    return f"DECIMAL({p},{s or 0})" if p is not None else "unbounded DECIMAL"
+
+
+def _classify_decimal_change(old_col, new_col):
+    op, os_ = old_col.precision, old_col.scale or 0
+    np_, ns = new_col.precision, new_col.scale or 0
+    label = f"{_decimal(op, os_)} → {_decimal(np_, ns)}"
+    problems = []
+    if np_ is not None:
+        if op is None:
+            problems.append("precision is now bounded")
+        else:
+            if ns < os_:
+                problems.append(f"scale decreased from {os_} to {ns} — fractional digits will be rounded")
+            if np_ - ns < op - os_:
+                problems.append(
+                    f"integer digits decreased from {op - os_} to {np_ - ns} — large values may overflow"
+                )
+    if problems:
+        return (
+            ChangeType.TYPE_CHANGED,
+            ChangeSeverity.WARNING,
+            f"{label}: {'; '.join(problems)}.",
+        )
+    return (ChangeType.TYPE_WIDENED, ChangeSeverity.SAFE, f"{label} — safe widening.")
 
 
 def _classify_type_change(
@@ -52,41 +126,11 @@ def _classify_type_change(
     # Same logical type — check length/precision changes
     if old_t == new_t:
         if old_t == ColumnType.VARCHAR:
-            old_len = old_col.max_length or 0
-            new_len = new_col.max_length or 0
-            if new_len > old_len or new_len == 0:
-                return (
-                    ChangeType.TYPE_WIDENED,
-                    ChangeSeverity.SAFE,
-                    f"VARCHAR length increased from {old_len} to {new_len} — safe widening."
-                )
-            elif new_len < old_len:
-                return (
-                    ChangeType.TYPE_CHANGED,
-                    ChangeSeverity.BREAKING,
-                    f"VARCHAR length decreased from {old_len} to {new_len} — "
-                    f"existing data may be truncated on write."
-                )
-
+            return _classify_varchar_change(old_col, new_col)
         if old_t == ColumnType.DECIMAL:
-            old_prec = old_col.precision or 0
-            new_prec = new_col.precision or 0
-            if new_prec >= old_prec:
-                return (
-                    ChangeType.TYPE_WIDENED,
-                    ChangeSeverity.SAFE,
-                    f"DECIMAL precision increased from {old_prec} to {new_prec}."
-                )
-            else:
-                return (
-                    ChangeType.TYPE_CHANGED,
-                    ChangeSeverity.WARNING,
-                    f"DECIMAL precision decreased from {old_prec} to {new_prec} — "
-                    f"may lose precision on existing data."
-                )
-
-        # Same type, nothing else changed — shouldn't normally reach here
-        return (ChangeType.TYPE_CHANGED, ChangeSeverity.SAFE, "Same type, no attribute changes.")
+            return _classify_decimal_change(old_col, new_col)
+        return (ChangeType.TYPE_CHANGED, ChangeSeverity.SAFE,
+                f"{old_t.value} attributes changed (length/precision/scale).")
 
     # Different types — check widening rules
     if is_safe_widening(old_t, new_t):
@@ -122,21 +166,130 @@ def _classify_nullability_change(
         )
 
 
+def _type_attrs(col: ColumnSchema) -> dict:
+    return {"col_type": col.col_type.value, "max_length": col.max_length,
+            "precision": col.precision, "scale": col.scale}
+
+
+def _type_attrs_differ(old_col: ColumnSchema, new_col: ColumnSchema) -> bool:
+    return (old_col.col_type != new_col.col_type
+            or _length(old_col) != _length(new_col)
+            or old_col.precision != new_col.precision
+            or (old_col.scale or 0) != (new_col.scale or 0))
+
+
 # ─────────────────────────────────────────────
 # Core diff logic (recursive, prefix-aware)
 # ─────────────────────────────────────────────
+
+def _diff_column(
+    old_col: ColumnSchema,
+    new_col: ColumnSchema,
+    qualified: str,
+    sampled: bool,
+) -> list[ColumnChange]:
+    """All changes between two versions of one column. Each aspect (type,
+    nullability, default) is checked independently, so a column can report
+    several changes. STRUCT fields and ARRAY items are compared recursively
+    (``addr.zip``, ``tags[]``, ``tags[].x``)."""
+    changes: list[ColumnChange] = []
+    old_t, new_t = old_col.col_type, new_col.col_type
+
+    # Sampled source, value null in this sample: the type wasn't observed.
+    # Keep the baseline type; at most the column is now known to be nullable.
+    if sampled and new_t == ColumnType.UNKNOWN and old_t != ColumnType.UNKNOWN:
+        if new_col.nullable and not old_col.nullable:
+            changes.append(ColumnChange(
+                change_type=ChangeType.NULLABILITY_RELAXED,
+                column_name=qualified,
+                old_value={"nullable": False},
+                new_value={"nullable": True},
+                severity=ChangeSeverity.SAFE,
+                reasoning=f"'{qualified}' was null in this sample, so its type couldn't be observed. "
+                          f"The baseline type ({old_t.value}) is kept and the column is now "
+                          f"recorded as nullable.",
+            ))
+        return changes
+
+    # Type was unknown in the baseline and is known now.
+    if old_t == ColumnType.UNKNOWN and new_t != ColumnType.UNKNOWN:
+        why = ("no value was observed when the baseline was captured — null or an empty array"
+               if sampled else "the baseline type was not recognized")
+        changes.append(ColumnChange(
+            change_type=ChangeType.TYPE_RESOLVED,
+            column_name=qualified,
+            old_value=_type_attrs(old_col),
+            new_value=_type_attrs(new_col),
+            severity=ChangeSeverity.SAFE,
+            reasoning=f"'{qualified}' had an unknown type ({why}); it is now {new_t.value}. "
+                      f"Suggest recording {new_t.value} as its type in the next baseline version.",
+        ))
+        if not sampled and old_col.nullable != new_col.nullable:
+            changes.extend(_nullability_changes(old_col, new_col, qualified))
+        return changes
+
+    if old_t == ColumnType.STRUCT and new_t == ColumnType.STRUCT:
+        changes.extend(_diff_column_list(old_col.fields or [], new_col.fields or [],
+                                         f"{qualified}.", sampled))
+    elif old_t == ColumnType.ARRAY and new_t == ColumnType.ARRAY:
+        # Item types are compared only when both sides recorded them (older
+        # baselines and some readers don't).
+        if old_col.items is not None and new_col.items is not None:
+            changes.extend(_diff_column(old_col.items, new_col.items, f"{qualified}[]", sampled))
+    elif _type_attrs_differ(old_col, new_col):
+        change_type, severity, reasoning = _classify_type_change(old_col, new_col)
+        changes.append(ColumnChange(
+            change_type=change_type,
+            column_name=qualified,
+            old_value=_type_attrs(old_col),
+            new_value=_type_attrs(new_col),
+            severity=severity,
+            reasoning=reasoning,
+        ))
+
+    if old_col.nullable != new_col.nullable:
+        # In a sample, "no nulls seen" doesn't make a column NOT NULL.
+        if not (sampled and not new_col.nullable):
+            changes.extend(_nullability_changes(old_col, new_col, qualified))
+
+    if old_col.default_value != new_col.default_value:
+        changes.append(ColumnChange(
+            change_type=ChangeType.DEFAULT_CHANGED,
+            column_name=qualified,
+            old_value={"default_value": old_col.default_value},
+            new_value={"default_value": new_col.default_value},
+            severity=ChangeSeverity.WARNING,
+            reasoning=f"Default value changed from '{old_col.default_value}' "
+                      f"to '{new_col.default_value}'. "
+                      f"New rows will have different defaults — verify this is intentional."
+        ))
+    return changes
+
+
+def _nullability_changes(old_col, new_col, qualified) -> list[ColumnChange]:
+    severity, reasoning = _classify_nullability_change(old_col, new_col)
+    return [ColumnChange(
+        change_type=(ChangeType.NULLABILITY_RELAXED if new_col.nullable
+                     else ChangeType.NULLABILITY_TIGHTENED),
+        column_name=qualified,
+        old_value={"nullable": old_col.nullable},
+        new_value={"nullable": new_col.nullable},
+        severity=severity,
+        reasoning=reasoning,
+    )]
+
 
 def _diff_column_list(
     old_columns: list[ColumnSchema],
     new_columns: list[ColumnSchema],
     name_prefix: str = "",
+    sampled: bool = False,
 ) -> list[ColumnChange]:
     """
     Compare two lists of ColumnSchema and return all changes.
 
     name_prefix is dot-notation context for nested STRUCT fields,
     e.g. "address." produces change names like "address.street".
-    Calls itself recursively when both sides have a STRUCT column.
     """
     old_cols = {col.name: col for col in old_columns}
     new_cols = {col.name: col for col in new_columns}
@@ -161,109 +314,140 @@ def _diff_column_list(
     for col_name, new_col in new_cols.items():
         if col_name not in old_cols:
             qualified = f"{name_prefix}{col_name}"
-            severity = _classify_added_column(new_col)
-            reasoning = (
-                f"Column '{qualified}' ({new_col.col_type.value}) was added. "
-                + (
-                    "NOT NULL with no default — will break INSERT statements on existing pipeline logic."
-                    if severity == ChangeSeverity.BREAKING
-                    else "Nullable or has default — safe addition, existing queries unaffected."
-                )
-            )
+            severity = _classify_added_column(new_col, sampled)
+            if sampled:
+                detail = "New field in the payload — existing readers are unaffected."
+            elif severity == ChangeSeverity.BREAKING:
+                detail = "NOT NULL with no default — will break INSERT statements on existing pipeline logic."
+            else:
+                detail = "Nullable or has default — safe addition, existing queries unaffected."
             changes.append(ColumnChange(
                 change_type=ChangeType.COLUMN_ADDED,
                 column_name=qualified,
                 old_value=None,
                 new_value=new_col.to_dict(),
                 severity=severity,
-                reasoning=reasoning
+                reasoning=f"Column '{qualified}' ({new_col.col_type.value}) was added. {detail}",
             ))
 
     # ── Detect modifications on existing columns ────────────────────
-    for col_name in old_cols:
-        if col_name not in new_cols:
-            continue  # already handled above
+    for col_name, old_col in old_cols.items():
+        if col_name in new_cols:
+            changes.extend(_diff_column(old_col, new_cols[col_name],
+                                        f"{name_prefix}{col_name}", sampled))
 
-        old_col = old_cols[col_name]
-        new_col = new_cols[col_name]
-        qualified = f"{name_prefix}{col_name}"
-
-        # Both sides are STRUCT — recurse into nested fields
-        if old_col.col_type == ColumnType.STRUCT and new_col.col_type == ColumnType.STRUCT:
-            changes.extend(
-                _diff_column_list(
-                    old_col.fields or [],
-                    new_col.fields or [],
-                    f"{qualified}.",
-                )
-            )
-            continue
-
-        # Type change (includes same-type attribute changes like precision, length)
-        if (old_col.col_type != new_col.col_type
-                or old_col.max_length != new_col.max_length
-                or old_col.precision != new_col.precision
-                or old_col.scale != new_col.scale):
-            change_type, severity, reasoning = _classify_type_change(old_col, new_col)
+    # ── Detect column reordering (meaningless for JSON objects) ─────
+    if not sampled:
+        old_order = [c.name for c in old_columns if c.name in new_cols]
+        new_order = [c.name for c in new_columns if c.name in old_cols]
+        if old_order != new_order:
             changes.append(ColumnChange(
-                change_type=change_type,
-                column_name=qualified,
-                old_value={"col_type": old_col.col_type.value, "max_length": old_col.max_length},
-                new_value={"col_type": new_col.col_type.value, "max_length": new_col.max_length},
-                severity=severity,
-                reasoning=reasoning
-            ))
-
-        # Nullability change
-        elif old_col.nullable != new_col.nullable:
-            severity, reasoning = _classify_nullability_change(old_col, new_col)
-            change_type = (
-                ChangeType.NULLABILITY_RELAXED
-                if not old_col.nullable and new_col.nullable
-                else ChangeType.NULLABILITY_TIGHTENED
-            )
-            changes.append(ColumnChange(
-                change_type=change_type,
-                column_name=qualified,
-                old_value={"nullable": old_col.nullable},
-                new_value={"nullable": new_col.nullable},
-                severity=severity,
-                reasoning=reasoning
-            ))
-
-        # Default value change
-        elif old_col.default_value != new_col.default_value:
-            changes.append(ColumnChange(
-                change_type=ChangeType.DEFAULT_CHANGED,
-                column_name=qualified,
-                old_value={"default_value": old_col.default_value},
-                new_value={"default_value": new_col.default_value},
+                change_type=ChangeType.COLUMN_REORDERED,
+                column_name=f"{name_prefix}<multiple>",
+                old_value={"order": old_order},
+                new_value={"order": new_order},
                 severity=ChangeSeverity.WARNING,
-                reasoning=f"Default value changed from '{old_col.default_value}' "
-                          f"to '{new_col.default_value}'. "
-                          f"New rows will have different defaults — verify this is intentional."
+                reasoning="Column order changed. Named column access is unaffected, "
+                          "but any positional access (SELECT *, CSV exports, legacy COBOL-style consumers) "
+                          "may read wrong values silently — the most dangerous kind of bug."
             ))
-
-    # ── Detect column reordering ────────────────────────────────────
-    shared_cols_old = [c for c in old_columns if c.name in new_cols]
-    shared_cols_new = [c for c in new_columns if c.name in old_cols]
-    old_order = [c.name for c in shared_cols_old]
-    new_order = [c.name for c in shared_cols_new]
-
-    if old_order != new_order:
-        reorder_name = f"{name_prefix}<multiple>" if name_prefix else "<multiple>"
-        changes.append(ColumnChange(
-            change_type=ChangeType.COLUMN_REORDERED,
-            column_name=reorder_name,
-            old_value={"order": old_order},
-            new_value={"order": new_order},
-            severity=ChangeSeverity.WARNING,
-            reasoning="Column order changed. Named column access is unaffected, "
-                      "but any positional access (SELECT *, CSV exports, legacy COBOL-style consumers) "
-                      "may read wrong values silently — the most dangerous kind of bug."
-        ))
 
     return changes
+
+
+def _diff_keys(old_schema: TableSchema, new_schema: TableSchema) -> list[ColumnChange]:
+    """Partition and clustering/sort keys (WARNING: layout and pruning, not correctness)."""
+    changes = []
+    for attr, change_type, label, effect in (
+        ("partition_keys", ChangeType.PARTITION_CHANGED, "Partition keys",
+         "Partition pruning, file layout and queries filtering on the old partitioning may change."),
+        ("clustering_keys", ChangeType.CLUSTERING_CHANGED, "Clustering/sort keys",
+         "Data ordering and clustering-based performance may change."),
+    ):
+        old_keys = list(getattr(old_schema, attr) or [])
+        new_keys = list(getattr(new_schema, attr) or [])
+        if old_keys != new_keys:
+            changes.append(ColumnChange(
+                change_type=change_type,
+                column_name=f"<{attr}>",
+                old_value={attr: old_keys},
+                new_value={attr: new_keys},
+                severity=ChangeSeverity.WARNING,
+                reasoning=f"{label} changed from {old_keys or 'none'} to {new_keys or 'none'}. {effect}",
+            ))
+    return changes
+
+
+# ─────────────────────────────────────────────
+# Suggested baseline update (only when every change is SAFE)
+# ─────────────────────────────────────────────
+
+def _merge_column(old: ColumnSchema, new: ColumnSchema, sampled: bool) -> ColumnSchema:
+    """The column to store in the next baseline. For sampled sources keep what
+    the baseline already knew: a type isn't forgotten because a value was null,
+    and a nullable column stays nullable when a sample happens to have no nulls."""
+    if sampled and new.col_type == ColumnType.UNKNOWN and old.col_type != ColumnType.UNKNOWN:
+        return replace(old, nullable=old.nullable or new.nullable)
+    merged = replace(new)
+    if sampled and old.nullable and not new.nullable:
+        merged.nullable = True
+    if old.col_type == new.col_type == ColumnType.STRUCT:
+        merged.fields = _merge_columns(old.fields or [], new.fields or [], sampled)
+    elif old.col_type == new.col_type == ColumnType.ARRAY and old.items and new.items:
+        merged.items = _merge_column(old.items, new.items, sampled)
+    return merged
+
+
+def _merge_columns(old_cols, new_cols, sampled) -> list[ColumnSchema]:
+    old_map = {c.name: c for c in old_cols}
+    return [_merge_column(old_map[c.name], c, sampled) if c.name in old_map else c
+            for c in new_cols]
+
+
+def _type_name(t) -> str:
+    return getattr(t, "value", t) or "?"
+
+
+def _fmt_type(attrs: dict | None) -> str:
+    attrs = attrs or {}
+    t = _type_name(attrs.get("col_type"))
+    if t == ColumnType.VARCHAR.value:
+        return _varchar(attrs.get("max_length"))
+    if t == ColumnType.DECIMAL.value:
+        return _decimal(attrs.get("precision"), attrs.get("scale"))
+    return t
+
+
+def _explain(change: ColumnChange) -> str:
+    """One-line description of what the baseline update records for a change."""
+    n, new = change.column_name, change.new_value or {}
+    ct = change.change_type
+    if ct == ChangeType.COLUMN_ADDED:
+        return f"add '{n}' ({_type_name(new.get('col_type'))})"
+    if ct == ChangeType.TYPE_RESOLVED:
+        return f"set the type of '{n}' to {_type_name(new.get('col_type'))} (was unknown)"
+    if ct == ChangeType.TYPE_WIDENED:
+        return f"widen '{n}' from {_fmt_type(change.old_value)} to {_fmt_type(new)}"
+    if ct == ChangeType.NULLABILITY_RELAXED:
+        return f"mark '{n}' as nullable"
+    return f"{ct.value.replace('_', ' ')} on '{n}'"
+
+
+def build_suggested_update(old_schema: TableSchema, new_schema: TableSchema,
+                           changes: list[ColumnChange]) -> dict:
+    """Explanation + the schema to register as the next baseline version."""
+    sampled = _is_sampled(old_schema, new_schema)
+    merged = replace(
+        new_schema,
+        columns=(_merge_columns(old_schema.columns, new_schema.columns, sampled)
+                 if sampled else new_schema.columns),
+    )
+    return {
+        "action": "update_baseline",
+        "based_on_version": old_schema.captured_at,
+        "explanation": [_explain(c) for c in changes],
+        "schema": merged.to_dict(),
+    }
 
 
 # ─────────────────────────────────────────────
@@ -282,7 +466,9 @@ def compare_schemas(old_schema: TableSchema, new_schema: TableSchema) -> ToolRes
         ToolResult with SchemaDiff in data
     """
     try:
-        changes = _diff_column_list(old_schema.columns, new_schema.columns)
+        sampled = _is_sampled(old_schema, new_schema)
+        changes = _diff_column_list(old_schema.columns, new_schema.columns, sampled=sampled)
+        changes.extend(_diff_keys(old_schema, new_schema))
 
         # ── Compute overall severity ────────────────────────────────────
         severities = [c.severity for c in changes]
@@ -315,9 +501,13 @@ def compare_schemas(old_schema: TableSchema, new_schema: TableSchema) -> ToolRes
             overall_severity=overall,
             summary=summary,
         )
+        if changes and overall == ChangeSeverity.SAFE:
+            diff.suggested_update = build_suggested_update(old_schema, new_schema, changes)
 
         hint = {
-            ChangeSeverity.SAFE:     "All changes are safe. Consider calling register_schema() to update the baseline.",
+            ChangeSeverity.SAFE:     ("All changes are safe. The diff's suggested_update holds the schema to "
+                                      "register as the next baseline version (CLI: --update; MCP: "
+                                      "accept_safe_schema_update)."),
             ChangeSeverity.WARNING:  "Some changes need review. Inspect WARNING items before proceeding.",
             ChangeSeverity.BREAKING: "BREAKING changes detected. Do NOT auto-apply. Escalate or generate a migration plan.",
         }[overall]
@@ -345,17 +535,11 @@ def compare_schemas_from_dicts(old_dict: dict, new_dict: dict) -> ToolResult:
     if not new_result.success:
         return ToolResult(success=False, error=f"New schema invalid: {new_result.error}")
 
-    def dict_to_table_schema(d: dict) -> TableSchema:
-        s = d["schema"]
-        return TableSchema(
-            table_name=s["table_name"],
-            columns=[ColumnSchema.from_dict(c) for c in s["columns"]],
-            partition_keys=s.get("partition_keys", []),
-            captured_at=s.get("captured_at"),
-            source=s.get("source", "unknown"),
-        )
-
-    return compare_schemas(
-        dict_to_table_schema(old_result.data),
-        dict_to_table_schema(new_result.data),
-    )
+    # Keep the original source and captured_at (get_schema_from_json stamps "now").
+    old_schema = TableSchema.from_dict({**old_result.data["schema"],
+                                        "captured_at": old_dict.get("captured_at"),
+                                        "source": old_dict.get("source", "unknown")})
+    new_schema = TableSchema.from_dict({**new_result.data["schema"],
+                                        "captured_at": new_dict.get("captured_at"),
+                                        "source": new_dict.get("source", "unknown")})
+    return compare_schemas(old_schema, new_schema)

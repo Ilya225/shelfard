@@ -107,6 +107,7 @@ class PostgresChecker(Checker):
             data={
                 "schema_name": self.config.schema_name,
                 "baseline_version": baseline_result.data["version"],
+                "baseline_version_number": baseline_result.data.get("version_number"),
                 "diff": diff_result.data["diff"],
             },
         )
