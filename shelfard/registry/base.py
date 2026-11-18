@@ -38,6 +38,17 @@ class SchemaRegistry(ABC):
         """List all source schemas with summary metadata."""
         ...
 
+    def get_schema_history(self, table_name: str) -> ToolResult:
+        """
+        All registered versions of a source schema, oldest first.
+
+        Returns ToolResult with data={"versions": [schema dict, ...]}. Optional
+        for backends (used by ODCS export to derive semantic versions); the
+        default reports it as unsupported.
+        """
+        return ToolResult(success=False,
+                          error=f"{type(self).__name__} does not support schema history.")
+
     # ── Consumer subscriptions ────────────────────────────────────────────────
 
     @abstractmethod
@@ -169,6 +180,12 @@ class SchemaRegistry(ABC):
             result = self.get_var(match.group(1))
             return result.data["value"] if result.success else match.group(0)
         return re.sub(r"\{\{([a-zA-Z_][a-zA-Z0-9_]*)\}\}", _replace, template)
+
+    def fetch_checker_schema(self, schema_name: str) -> ToolResult:
+        """Read the live schema through a stored checker without comparing it
+        (data={"schema": {...}}). Optional; the default reports it as unsupported."""
+        return ToolResult(success=False,
+                          error=f"{type(self).__name__} does not support fetching live schemas.")
 
     # ── Baseline updates ──────────────────────────────────────────────────────
 

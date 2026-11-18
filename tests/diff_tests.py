@@ -400,6 +400,163 @@ test("agent asks for approval before accept_safe_schema_update", test_agent_requ
 
 
 # ─────────────────────────────────────────────
+# TIME, physical types, constraints
+# ─────────────────────────────────────────────
+
+print("\nTIME, physical types and constraints")
+
+from shelfard.models import ColumnConstraints as K  # noqa: E402
+
+
+def test_time_vs_timestamp_breaking():
+    d = diff(db(C("t", T.TIME)), db(C("t", T.TIMESTAMP)))
+    assert kinds(d) == [("t", CT.TYPE_CHANGED, S.BREAKING)], kinds(d)
+
+
+test("TIME → TIMESTAMP is BREAKING (no widening rule)", test_time_vs_timestamp_breaking)
+
+
+def test_physical_type_warning():
+    d = diff(db(C("at", T.TIMESTAMP, physical_type="timestamp with time zone")),
+             db(C("at", T.TIMESTAMP, physical_type="timestamp without time zone")))
+    assert kinds(d) == [("at", CT.PHYSICAL_TYPE_CHANGED, S.WARNING)], kinds(d)
+    assert "timestamp with time zone" in d["changes"][0]["reasoning"]
+    assert d["suggested_update"] is None
+
+
+test("same type, different physical type → WARNING", test_physical_type_warning)
+
+
+def test_physical_type_not_compared():
+    # Not recorded on one side (older baseline) → nothing to compare.
+    assert kinds(diff(db(C("a", T.TEXT)), db(C("a", T.TEXT, physical_type="text")))) == []
+    # A type change already explains the physical change.
+    d = diff(db(C("a", T.INTEGER, physical_type="int4")), db(C("a", T.BIGINT, physical_type="int8")))
+    assert kinds(d) == [("a", CT.TYPE_WIDENED, S.SAFE)], kinds(d)
+    # Sampled null: type (and JSON type) unknown in this sample.
+    d = diff(rest(infer("a", "x")), rest(infer("a", None)))
+    assert all(c["change_type"] != CT.PHYSICAL_TYPE_CHANGED for c in d["changes"]), kinds(d)
+    # Containers: nested fields / items are diffed themselves.
+    assert kinds(diff(db(C("s", T.STRUCT, physical_type="struct<a: int64>", fields=[C("a", T.BIGINT)])),
+                      db(C("s", T.STRUCT, physical_type="struct<a: int64, b: string>",
+                           fields=[C("a", T.BIGINT), C("b", T.TEXT)])))) == [("s.b", CT.COLUMN_ADDED, S.SAFE)]
+    # UNKNOWN on both sides with different raw types: nothing meaningful to say.
+    assert kinds(diff(db(C("b", T.UNKNOWN, physical_type="bytea")),
+                      db(C("b", T.UNKNOWN, physical_type="blob")))) == []
+
+
+test("physical type compared only when both sides know it and the type is the same",
+     test_physical_type_not_compared)
+
+
+def test_constraint_warnings():
+    old = db(C("id", T.BIGINT, nullable=False, constraints=K(primary_key=True, primary_key_position=1,
+                                                             unique=False)),
+             C("email", T.VARCHAR, constraints=K(primary_key=False, unique=False)),
+             C("tags", T.ARRAY, constraints=K(max_items=5)))
+    new = db(C("id", T.BIGINT, nullable=False, constraints=K(primary_key=False, unique=False)),
+             C("email", T.VARCHAR, constraints=K(primary_key=False, unique=True)),
+             C("tags", T.ARRAY, constraints=K(max_items=10)))
+    d = diff(old, new)
+    assert kinds(d) == [("id", CT.CONSTRAINT_CHANGED, S.WARNING),
+                        ("email", CT.CONSTRAINT_CHANGED, S.WARNING),
+                        ("tags", CT.CONSTRAINT_CHANGED, S.WARNING)], kinds(d)
+    by = {c["column_name"]: c for c in d["changes"]}
+    assert "primary key removed" in by["id"]["reasoning"], by["id"]["reasoning"]
+    assert by["id"]["old_value"] == {"primary_key": True}, by["id"]   # position unknown on new side
+    assert "unique added" in by["email"]["reasoning"]
+    assert "max items 5 → 10" in by["tags"]["reasoning"]
+    assert d["overall_severity"] == S.WARNING and d["suggested_update"] is None
+
+
+test("PK removed / unique added / maxItems changed → WARNING", test_constraint_warnings)
+
+
+def test_constraints_unknown_not_compared():
+    # Older baseline without constraints, or a source that can't observe them.
+    assert kinds(diff(db(C("id", T.BIGINT)), db(C("id", T.BIGINT, constraints=K(primary_key=True))))) == []
+    # Contract states a pattern; Postgres can't observe patterns (None) → no change.
+    assert kinds(diff(db(C("e", T.VARCHAR, constraints=K(pattern="^.+@.+$"))),
+                      db(C("e", T.VARCHAR, constraints=K(primary_key=False))))) == []
+
+
+test("constraint attributes compared only when both sides know them", test_constraints_unknown_not_compared)
+
+
+def test_old_baseline_dict_no_noise():
+    old = {"table_name": "t", "source": "postgresql", "captured_at": "2026-01-01",
+           "columns": [{"name": "id", "col_type": "bigint", "nullable": False}]}
+    new = db(C("id", T.BIGINT, nullable=False, physical_type="bigint",
+               constraints=K(primary_key=True, primary_key_position=1, unique=False))).to_dict()
+    r = compare_schemas_from_dicts(old, new)
+    assert r.success and r.data["diff"]["changes"] == [], r.data
+
+
+test("baselines saved before physical types/constraints existed report no drift",
+     test_old_baseline_dict_no_noise)
+
+
+def test_resolved_uuid_records_physical_and_constraints():
+    old = db(C("ext", T.UNKNOWN))                                   # saved when uuid was unmapped
+    new = db(C("ext", T.VARCHAR, physical_type="uuid", constraints=K(primary_key=False, format="uuid")))
+    d = diff(old, new)
+    assert kinds(d) == [("ext", CT.TYPE_RESOLVED, S.SAFE)], kinds(d)
+    col = d["suggested_update"]["schema"]["columns"][0]
+    assert col["physical_type"] == "uuid" and col["constraints"]["format"] == "uuid", col
+
+
+test("UNKNOWN → VARCHAR (uuid) is type_resolved; update records physical type + format",
+     test_resolved_uuid_records_physical_and_constraints)
+
+
+def test_sampled_merge_keeps_constraints():
+    old = rest(C("id", T.INTEGER, nullable=False, physical_type="integer", constraints=K(minimum=0)))
+    new = rest(infer("id", 5), infer("extra", "x"))
+    col = diff(old, new)["suggested_update"]["schema"]["columns"][0]
+    assert col["constraints"]["minimum"] == 0 and col["physical_type"] == "integer", col
+
+
+test("sampled update keeps constraints the baseline knew", test_sampled_merge_keeps_constraints)
+
+
+def test_sqlite_reader_pk_unique_physical():
+    import sqlite3
+    from shelfard import get_sqlite_schema
+    with tempfile.TemporaryDirectory() as tmp:
+        path = str(Path(tmp) / "t.db")
+        conn = sqlite3.connect(path)
+        conn.execute("CREATE TABLE t (a INTEGER, b TEXT, email VARCHAR(80) UNIQUE, at TIME, "
+                     "x INT, y INT, PRIMARY KEY (b, a))")
+        conn.execute("CREATE UNIQUE INDEX t_xy ON t (x, y)")     # composite: not per-column unique
+        conn.commit()
+        conn.close()
+        r = get_sqlite_schema(path, "t")
+        assert r.success, r.error
+        c = {col["name"]: col for col in r.data["schema"]["columns"]}
+    assert c["b"]["constraints"]["primary_key"] and c["b"]["constraints"]["primary_key_position"] == 1
+    assert c["a"]["constraints"]["primary_key_position"] == 2
+    assert c["email"]["constraints"] == {**c["email"]["constraints"], "primary_key": False, "unique": True}
+    assert c["x"]["constraints"]["unique"] is False
+    assert c["at"]["col_type"] == "time"
+    assert c["email"]["physical_type"] == "VARCHAR(80)"
+
+
+test("SQLite reader: composite PK positions, single-column UNIQUE, TIME, physical type",
+     test_sqlite_reader_pk_unique_physical)
+
+
+def test_json_physical_types():
+    assert infer("a", "x").physical_type == "string"
+    assert infer("a", 1).physical_type == "integer"
+    assert infer("a", 1.5).physical_type == "number"
+    assert infer("a", None).physical_type is None
+    assert infer("a", {"b": True}).fields[0].physical_type == "boolean"
+
+
+test("JSON inference records the JSON type as physical_type", test_json_physical_types)
+
+
+# ─────────────────────────────────────────────
 # Summary
 # ─────────────────────────────────────────────
 

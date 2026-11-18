@@ -13,7 +13,7 @@ The output SchemaDiff is designed to be:
 from dataclasses import replace
 
 from .models import (
-    ColumnSchema, TableSchema, SchemaDiff, ColumnChange,
+    ColumnConstraints, ColumnSchema, TableSchema, SchemaDiff, ColumnChange,
     ChangeType, ChangeSeverity, ToolResult, ColumnType
 )
 from .type_normalizer import is_safe_widening
@@ -166,6 +166,66 @@ def _classify_nullability_change(
         )
 
 
+def _physical_type_change(old_col: ColumnSchema, new_col: ColumnSchema,
+                          qualified: str) -> list[ColumnChange]:
+    """Same normalized type, different vendor type (e.g. timestamptz → timestamp).
+    Compared only when both sides recorded a physical type and the type is known.
+    STRUCT / ARRAY are skipped: their fields and items are compared themselves."""
+    if (old_col.physical_type is None or new_col.physical_type is None
+            or old_col.physical_type == new_col.physical_type
+            or old_col.col_type != new_col.col_type
+            or old_col.col_type in (ColumnType.UNKNOWN, ColumnType.STRUCT, ColumnType.ARRAY)):
+        return []
+    return [ColumnChange(
+        change_type=ChangeType.PHYSICAL_TYPE_CHANGED,
+        column_name=qualified,
+        old_value={"physical_type": old_col.physical_type},
+        new_value={"physical_type": new_col.physical_type},
+        severity=ChangeSeverity.WARNING,
+        reasoning=f"Physical type of '{qualified}' changed from {old_col.physical_type} to "
+                  f"{new_col.physical_type} (still {new_col.col_type.value}). Semantics such as time "
+                  f"zone handling, padding or storage size may differ — verify consumers.",
+    )]
+
+
+_CONSTRAINT_LABELS = {
+    "primary_key": "primary key", "primary_key_position": "primary key position",
+    "unique": "unique", "format": "format", "pattern": "pattern",
+    "minimum": "minimum", "maximum": "maximum",
+    "exclusive_minimum": "exclusive minimum", "exclusive_maximum": "exclusive maximum",
+    "multiple_of": "multiple of", "min_length": "min length",
+    "min_items": "min items", "max_items": "max items", "unique_items": "unique items",
+}
+
+
+def _constraint_change(old_col: ColumnSchema, new_col: ColumnSchema,
+                       qualified: str) -> list[ColumnChange]:
+    """Any constraint difference is a WARNING. An attribute is compared only
+    when both sides know it (``None`` = not observable / not stated), so older
+    baselines and sources that can't see a constraint never produce noise."""
+    old_d = old_col.constraints.known() if old_col.constraints else {}
+    new_d = new_col.constraints.known() if new_col.constraints else {}
+    differing = [k for k in old_d if k in new_d and old_d[k] != new_d[k]]
+    if not differing:
+        return []
+    phrases = []
+    for k in differing:
+        label, before, after = _CONSTRAINT_LABELS.get(k, k), old_d[k], new_d[k]
+        if isinstance(before, bool) and isinstance(after, bool):
+            phrases.append(f"{label} {'added' if after else 'removed'}")
+        else:
+            phrases.append(f"{label} {before} → {after}")
+    return [ColumnChange(
+        change_type=ChangeType.CONSTRAINT_CHANGED,
+        column_name=qualified,
+        old_value={k: old_d[k] for k in differing},
+        new_value={k: new_d[k] for k in differing},
+        severity=ChangeSeverity.WARNING,
+        reasoning=f"Constraints on '{qualified}' changed: {'; '.join(phrases)}. Consumers may rely on "
+                  f"these guarantees (joins, deduplication, validation) — verify this is intentional.",
+    )]
+
+
 def _type_attrs(col: ColumnSchema) -> dict:
     return {"col_type": col.col_type.value, "max_length": col.max_length,
             "precision": col.precision, "scale": col.scale}
@@ -189,7 +249,7 @@ def _diff_column(
     sampled: bool,
 ) -> list[ColumnChange]:
     """All changes between two versions of one column. Each aspect (type,
-    nullability, default) is checked independently, so a column can report
+    physical type, constraints, nullability, default) is checked independently, so a column can report
     several changes. STRUCT fields and ARRAY items are compared recursively
     (``addr.zip``, ``tags[]``, ``tags[].x``)."""
     changes: list[ColumnChange] = []
@@ -246,6 +306,9 @@ def _diff_column(
             severity=severity,
             reasoning=reasoning,
         ))
+
+    changes.extend(_physical_type_change(old_col, new_col, qualified))
+    changes.extend(_constraint_change(old_col, new_col, qualified))
 
     if old_col.nullable != new_col.nullable:
         # In a sample, "no nulls seen" doesn't make a column NOT NULL.
@@ -389,6 +452,13 @@ def _merge_column(old: ColumnSchema, new: ColumnSchema, sampled: bool) -> Column
     if sampled and new.col_type == ColumnType.UNKNOWN and old.col_type != ColumnType.UNKNOWN:
         return replace(old, nullable=old.nullable or new.nullable)
     merged = replace(new)
+    # Attributes the new sample didn't record are kept from the baseline.
+    if merged.physical_type is None:
+        merged.physical_type = old.physical_type
+    if old.constraints is not None:
+        # Keep attributes the baseline knew and the new sample doesn't.
+        known = {**old.constraints.known(), **(new.constraints.known() if new.constraints else {})}
+        merged.constraints = ColumnConstraints.from_dict(known)
     if sampled and old.nullable and not new.nullable:
         merged.nullable = True
     if old.col_type == new.col_type == ColumnType.STRUCT:
@@ -430,6 +500,11 @@ def _explain(change: ColumnChange) -> str:
         return f"widen '{n}' from {_fmt_type(change.old_value)} to {_fmt_type(new)}"
     if ct == ChangeType.NULLABILITY_RELAXED:
         return f"mark '{n}' as nullable"
+    if ct == ChangeType.PHYSICAL_TYPE_CHANGED:
+        return (f"change the physical type of '{n}' from "
+                f"{(change.old_value or {}).get('physical_type')} to {new.get('physical_type')}")
+    if ct == ChangeType.CONSTRAINT_CHANGED:
+        return f"update constraints on '{n}': {', '.join(sorted(new))}"
     return f"{ct.value.replace('_', ' ')} on '{n}'"
 
 

@@ -79,6 +79,7 @@ _READ_TOOLS_DOC = """\
 - get_checker_config(schema_name) — show a registered checker
 - live_check_schema(schema_name) — run a registered checker against the live source; when every
   change is SAFE the result has a suggested_update — explain it and offer to apply it
+- get_schema_odcs(schema_name, version?) — export a schema as an ODCS v3.1.0 data contract
 - list_template_vars / get_template_var(name) — inspect stored template variables"""
 
 _WRITE_TOOLS_DOC = """

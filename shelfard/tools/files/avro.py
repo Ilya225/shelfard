@@ -14,7 +14,11 @@ Mapping rules:
     ``array`` → ARRAY; ``bytes`` / ``fixed`` → UNKNOWN unless a logical type
     applies.
   * Logical types: ``decimal`` → DECIMAL(precision, scale), ``date`` → DATE,
-    ``timestamp-*`` / ``local-timestamp-*`` → TIMESTAMP, ``uuid`` → VARCHAR.
+    ``timestamp-*`` / ``local-timestamp-*`` → TIMESTAMP, ``time-*`` → TIME,
+    ``uuid`` → VARCHAR (``constraints.format = "uuid"``).
+  * ``physical_type`` is the Avro type name: the logical type when there is
+    one (``timestamp-micros``), else the primitive / complex type (``long``,
+    ``record``, ``enum``, ...).
   * Field ``default`` is kept as its JSON text (``null`` → ``"null"``) because
     for Avro "has a default" matters for reader/writer compatibility.
   * Field ``doc`` → description.
@@ -26,7 +30,7 @@ import json
 from pathlib import Path
 from typing import BinaryIO
 
-from ...models import ColumnSchema, ColumnType
+from ...models import ColumnConstraints, ColumnSchema, ColumnType
 
 _MAGIC = b"Obj\x01"
 _MAX_HEADER_BYTES = 16 * 1024 * 1024   # sanity bound for metadata entries
@@ -50,6 +54,8 @@ _LOGICAL: dict[str, ColumnType] = {
     "local-timestamp-millis": ColumnType.TIMESTAMP,
     "local-timestamp-micros": ColumnType.TIMESTAMP,
     "local-timestamp-nanos":  ColumnType.TIMESTAMP,
+    "time-millis":            ColumnType.TIME,
+    "time-micros":            ColumnType.TIME,
     "uuid":                   ColumnType.VARCHAR,
 }
 
@@ -152,7 +158,7 @@ def _map_type(schema, names: _Names, namespace: str | None) -> tuple[ColumnType,
     # Primitive name or reference to a named type
     if isinstance(schema, str):
         if schema in _PRIMITIVES:
-            return _PRIMITIVES[schema], schema == "null", {}
+            return _PRIMITIVES[schema], schema == "null", {"physical_type": schema}
         named = names.resolve(schema, namespace)
         if named is None:
             return ColumnType.UNKNOWN, False, {}
@@ -175,9 +181,13 @@ def _map_complex(schema: dict, names: _Names, namespace: str | None,
         return ColumnType.DECIMAL, False, {
             "precision": schema.get("precision"),
             "scale": schema.get("scale", 0),
+            "physical_type": "decimal",
         }
     if logical in _LOGICAL:
-        return _LOGICAL[logical], False, {}
+        extra = {"physical_type": logical}
+        if logical == "uuid":
+            extra["constraints"] = ColumnConstraints(format="uuid")
+        return _LOGICAL[logical], False, extra
 
     if t == "record" or t == "error":
         full = names.fullname(schema["name"], schema.get("namespace", namespace))
@@ -185,29 +195,29 @@ def _map_complex(schema: dict, names: _Names, namespace: str | None,
             names.add(schema, namespace)
         if full in names.in_progress:
             # Recursive type (e.g. a linked-list node): don't expand it again.
-            return ColumnType.STRUCT, False, {}
+            return ColumnType.STRUCT, False, {"physical_type": t}
         names.in_progress.add(full)
         try:
             inner_ns = full.rpartition(".")[0] or None
             fields = [_field_to_column(f, names, inner_ns) for f in schema.get("fields", [])]
         finally:
             names.in_progress.discard(full)
-        return ColumnType.STRUCT, False, {"fields": fields}
+        return ColumnType.STRUCT, False, {"fields": fields, "physical_type": t}
     if t == "enum":
         if define:
             names.add(schema, namespace)
-        return ColumnType.VARCHAR, False, {}
+        return ColumnType.VARCHAR, False, {"physical_type": "enum"}
     if t == "fixed":
         if define:
             names.add(schema, namespace)
-        return ColumnType.UNKNOWN, False, {}
+        return ColumnType.UNKNOWN, False, {"physical_type": "fixed"}
     if t == "array":
         # Element types are parsed so named types defined inside are registered.
         _map_type(schema.get("items"), names, namespace)
-        return ColumnType.ARRAY, False, {}
+        return ColumnType.ARRAY, False, {"physical_type": "array"}
     if t == "map":
         _map_type(schema.get("values"), names, namespace)
-        return ColumnType.JSON, False, {}
+        return ColumnType.JSON, False, {"physical_type": "map"}
     # {"type": "long"} style wrapper around a primitive (or a nested type)
     if t is not None:
         return _map_type(t, names, namespace)

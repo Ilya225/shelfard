@@ -9,7 +9,7 @@ import os
 from datetime import datetime, timezone
 
 from ..base import SchemaReader
-from ...models import ColumnSchema, ColumnType, TableSchema, ToolResult
+from ...models import ColumnConstraints, ColumnSchema, ColumnType, TableSchema, ToolResult
 from ...type_normalizer import extract_length
 
 
@@ -34,6 +34,7 @@ _TYPE_MAP: dict[str, ColumnType] = {
     "date":      ColumnType.DATE,
     "datetime":  ColumnType.TIMESTAMP,
     "timestamp": ColumnType.TIMESTAMP,
+    "time":      ColumnType.TIME,
     "json":      ColumnType.JSON,
 }
 
@@ -43,6 +44,27 @@ def _normalize_type(raw_type: str) -> ColumnType:
     if "(" in cleaned:
         cleaned = cleaned[:cleaned.index("(")].strip()
     return _TYPE_MAP.get(cleaned, ColumnType.UNKNOWN)
+
+
+def _quote(identifier: str) -> str:
+    return '"' + identifier.replace('"', '""') + '"'
+
+
+def _single_column_unique(cursor, table_name: str) -> set[str]:
+    """Columns covered by a full (non-partial) single-column UNIQUE index."""
+    unique = set()
+    cursor.execute(f"PRAGMA index_list({_quote(table_name)})")
+    for row in cursor.fetchall():
+        # seq | name | unique | origin ('c' CREATE INDEX, 'u' UNIQUE, 'pk') | partial
+        name, is_unique, origin = row[1], row[2], row[3]
+        partial = row[4] if len(row) > 4 else 0
+        if not is_unique or origin == "pk" or partial:
+            continue
+        cursor.execute(f"PRAGMA index_info({_quote(name)})")
+        cols = [r[2] for r in cursor.fetchall()]
+        if len(cols) == 1 and cols[0] is not None:
+            unique.add(cols[0])
+    return unique
 
 
 class SQLiteReader(SchemaReader):
@@ -86,6 +108,7 @@ class SQLiteReader(SchemaReader):
             # Get column info
             cursor.execute(f"PRAGMA table_info({table_name})")
             rows = cursor.fetchall()
+            unique_cols = _single_column_unique(cursor, table_name)
             conn.close()
 
             columns = []
@@ -100,6 +123,12 @@ class SQLiteReader(SchemaReader):
                     nullable=not bool(notnull),
                     max_length=max_length,
                     default_value=str(default_val) if default_val is not None else None,
+                    physical_type=raw_type or None,
+                    constraints=ColumnConstraints(
+                        primary_key=bool(is_pk),
+                        primary_key_position=int(is_pk) if is_pk else None,
+                        unique=name in unique_cols,
+                    ),
                 ))
 
             schema = TableSchema(

@@ -21,7 +21,12 @@ Mapping rules:
   * struct → STRUCT; list → ARRAY; map / variant → JSON;
     int → INTEGER; long → BIGINT; float/double → FLOAT; decimal(P,S) → DECIMAL;
     string → TEXT; uuid → VARCHAR; date → DATE; timestamp* → TIMESTAMP;
-    time / binary / fixed[L] / geometry / geography → UNKNOWN.
+    time → TIME; binary / fixed[L] / geometry / geography → UNKNOWN.
+  * ``physical_type`` is the Iceberg type string (``long``, ``decimal(10,2)``,
+    ``timestamptz``) or ``struct`` / ``list`` / ``map``.
+  * Constraints are recorded for every field: the schema's
+    ``identifier-field-ids`` become ``primary_key`` (position = order in that
+    list); ``uuid`` fields get ``format: uuid``.
   * Partition keys come from the default partition spec, rendered as the source
     column for identity transforms and ``transform(column)`` otherwise
     (e.g. ``day(created_at)``, ``bucket[16](id)``). The default sort order
@@ -35,7 +40,7 @@ import json
 import re
 from pathlib import Path
 
-from ...models import ColumnSchema, ColumnType
+from ...models import ColumnConstraints, ColumnSchema, ColumnType
 
 _DECIMAL_RE = re.compile(r"^decimal\(\s*(\d+)\s*,\s*(\d+)\s*\)$")
 _VERSION_RE = re.compile(r"^v?(\d+)[.-]")
@@ -53,6 +58,7 @@ _PRIMITIVES: dict[str, ColumnType] = {
     "timestamptz_ns": ColumnType.TIMESTAMP,
     "string":         ColumnType.TEXT,
     "uuid":           ColumnType.VARCHAR,
+    "time":           ColumnType.TIME,
     "variant":        ColumnType.JSON,
 }
 
@@ -113,34 +119,44 @@ def current_schema(metadata: dict) -> dict:
     raise ValueError("Iceberg metadata has no schema")
 
 
-def _map_type(t) -> tuple[ColumnType, dict]:
+def _map_type(t, identifiers: list[int]) -> tuple[ColumnType, dict]:
     if isinstance(t, str):
         if t in _PRIMITIVES:
-            return _PRIMITIVES[t], {}
+            return _PRIMITIVES[t], {"physical_type": t}
         m = _DECIMAL_RE.match(t)
         if m:
-            return ColumnType.DECIMAL, {"precision": int(m.group(1)), "scale": int(m.group(2))}
-        return ColumnType.UNKNOWN, {}     # time, binary, fixed[L], geometry, unknown, ...
+            return ColumnType.DECIMAL, {"precision": int(m.group(1)), "scale": int(m.group(2)),
+                                        "physical_type": t}
+        return ColumnType.UNKNOWN, {"physical_type": t}   # binary, fixed[L], geometry, ...
     if isinstance(t, dict):
         kind = t.get("type")
         if kind == "struct":
-            return ColumnType.STRUCT, {"fields": [_field_to_column(f) for f in t.get("fields", [])]}
+            return ColumnType.STRUCT, {
+                "fields": [_field_to_column(f, identifiers) for f in t.get("fields", [])],
+                "physical_type": "struct",
+            }
         if kind == "list":
-            return ColumnType.ARRAY, {}
+            return ColumnType.ARRAY, {"physical_type": "list"}
         if kind == "map":
-            return ColumnType.JSON, {}
+            return ColumnType.JSON, {"physical_type": "map"}
     return ColumnType.UNKNOWN, {}
 
 
-def _field_to_column(field: dict) -> ColumnSchema:
-    col_type, extra = _map_type(field.get("type"))
+def _field_to_column(field: dict, identifiers: list[int]) -> ColumnSchema:
+    col_type, extra = _map_type(field.get("type"), identifiers)
     default = field.get("write-default")
+    position = identifiers.index(field["id"]) + 1 if field.get("id") in identifiers else None
     return ColumnSchema(
         name=field["name"],
         col_type=col_type,
         nullable=not field.get("required", False),
         default_value=json.dumps(default) if default is not None else None,
         description=field.get("doc"),
+        constraints=ColumnConstraints(
+            primary_key=position is not None,
+            primary_key_position=position,
+            format="uuid" if field.get("type") == "uuid" else None,
+        ),
         **extra,
     )
 
@@ -197,5 +213,6 @@ def read_iceberg_schema(path: Path) -> tuple[list[ColumnSchema], list[str], list
     schema = current_schema(metadata)
     fields = schema.get("fields", [])
     names = _field_names_by_id(fields)
-    columns = [_field_to_column(f) for f in fields]
+    identifiers = list(schema.get("identifier-field-ids") or [])
+    columns = [_field_to_column(f, identifiers) for f in fields]
     return columns, _partition_keys(metadata, names), _clustering_keys(metadata, names), metadata_file

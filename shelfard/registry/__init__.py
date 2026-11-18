@@ -45,6 +45,8 @@ __all__ = [
     "delete_var",
     "resolve_template",
     "accept_safe_update",
+    "get_schema_history",
+    "fetch_checker_schema",
 ]
 
 # ── Default instance ──────────────────────────────────────────────────────────
@@ -72,3 +74,5 @@ list_vars                    = _default.list_vars
 delete_var                   = _default.delete_var
 resolve_template             = _default.resolve_template
 accept_safe_update           = _default.accept_safe_update
+get_schema_history           = _default.get_schema_history
+fetch_checker_schema         = _default.fetch_checker_schema

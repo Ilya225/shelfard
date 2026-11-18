@@ -58,6 +58,11 @@ _TYPE_MAP: dict[str, ColumnType] = {
     "timestamptz":                   ColumnType.TIMESTAMP,
     "timestamp without time zone":   ColumnType.TIMESTAMP,
     "timestamp with time zone":      ColumnType.TIMESTAMP,
+    "time":                          ColumnType.TIME,
+    "timetz":                        ColumnType.TIME,
+    "time without time zone":        ColumnType.TIME,
+    "time with time zone":           ColumnType.TIME,
+    "uuid":                          ColumnType.VARCHAR,   # + constraints.format = "uuid"
     "json":                          ColumnType.JSON,
     "jsonb":                         ColumnType.JSON,
     "array":                         ColumnType.ARRAY,
@@ -72,6 +77,14 @@ def _normalize_type(raw_type: str) -> ColumnType:
     if "(" in cleaned:
         cleaned = cleaned[: cleaned.index("(")].strip()
     return _TYPE_MAP.get(cleaned, ColumnType.UNKNOWN)
+
+
+# Raw types that imply a string format (ODCS ``logicalTypeOptions.format``).
+_STRING_FORMATS = {"uuid": "uuid"}
+
+
+def _string_format(raw_type: Optional[str]) -> Optional[str]:
+    return _STRING_FORMATS.get((raw_type or "").lower().strip())
 
 
 # ── Reader ────────────────────────────────────────────────────────────────────
@@ -215,6 +228,7 @@ class PostgresReader(SchemaReader):
             self.table,
             _normalize_type,
             db_schema=self.db_schema,
+            string_format=_string_format,
         )
 
     def _get_query_columns(self, cursor) -> list[ColumnSchema]:
@@ -235,7 +249,11 @@ class PostgresReader(SchemaReader):
             for col in desc
         }
 
-        return build_columns_from_query_result(desc, rows, type_code_map)
+        physical_types = {col.type_code: oid_to_typname.get(col.type_code) for col in desc}
+        return build_columns_from_query_result(
+            desc, rows, type_code_map,
+            physical_types=physical_types, string_format=_string_format,
+        )
 
 
 # ── Module-level wrappers ─────────────────────────────────────────────────────

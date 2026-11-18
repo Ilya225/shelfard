@@ -14,7 +14,9 @@ class RestChecker(Checker):
         self.config = config
         self.registry = registry  # SchemaRegistry instance
 
-    def run(self) -> ToolResult:
+    def fetch(self) -> ToolResult:
+        """Resolve the stored config and read the live schema (no comparison).
+        Returns the reader's ToolResult (data={"schema": {...}, ...})."""
         # 1. Validate all required env vars are present
         missing = [v for v in self.config.env if not os.environ.get(v)]
         if missing:
@@ -52,6 +54,13 @@ class RestChecker(Checker):
         ).get_schema()
         if not new_result.success:
             return ToolResult(success=False, error=f"Fetch failed: {new_result.error}")
+        return new_result
+
+    def run(self) -> ToolResult:
+        new_result = self.fetch()
+        if not new_result.success:
+            return new_result
+        url = self.registry.resolve_template(self.config.url)
 
         # 4. Load the saved baseline
         baseline_result = self.registry.get_registered_schema(self.config.schema_name)

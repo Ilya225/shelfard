@@ -1,5 +1,5 @@
 from .models import (
-    ColumnSchema, TableSchema, ColumnType,
+    ColumnSchema, ColumnConstraints, TableSchema, ColumnType,
     ChangeSeverity, ChangeType, SchemaDiff, ColumnChange, ToolResult,
     ConsumerSubscription, RestCheckerConfig, PostgresCheckerConfig, FileCheckerConfig, IcebergCheckerConfig,
 )
@@ -20,6 +20,7 @@ from .registry import (
     get_consumers_affected_by_diff,
     register_checker, get_checker, get_all_checkers, run_checker,
     set_var, get_var, list_vars, delete_var,
-    accept_safe_update,
+    accept_safe_update, get_schema_history, fetch_checker_schema,
 )
 from .schema_comparison import compare_schemas, compare_schemas_from_dicts
+from .odcs import to_odcs, from_odcs, export_odcs, import_odcs

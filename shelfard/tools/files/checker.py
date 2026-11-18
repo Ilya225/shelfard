@@ -20,7 +20,9 @@ class FileChecker(Checker):
         self.config = config
         self.registry = registry
 
-    def run(self) -> ToolResult:
+    def fetch(self) -> ToolResult:
+        """Resolve the stored config and read the live schema (no comparison).
+        Returns the reader's ToolResult (data={"schema": {...}, ...})."""
         missing = [name for name in self.config.env if name not in os.environ]
         if missing:
             return ToolResult(
@@ -37,6 +39,12 @@ class FileChecker(Checker):
         live = FileReader(path, self.config.schema_name, self.config.file_format).get_schema()
         if not live.success:
             return ToolResult(success=False, error=f"Failed to read live schema: {live.error}")
+        return live
+
+    def run(self) -> ToolResult:
+        live = self.fetch()
+        if not live.success:
+            return live
 
         baseline = self.registry.get_registered_schema(self.config.schema_name)
         if not baseline.success:

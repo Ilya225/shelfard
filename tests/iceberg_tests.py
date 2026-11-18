@@ -158,6 +158,26 @@ def test_iceberg_types(tmp):
 test("current schema, types, partition transforms, sort order", test_iceberg_types)
 
 
+def test_iceberg_identifier_fields_time_physical(tmp):
+    schema = {"type": "struct", "schema-id": 0, "identifier-field-ids": [2, 1], "fields": [
+        {"id": 1, "name": "tenant", "required": True, "type": "string"},
+        {"id": 2, "name": "order_id", "required": True, "type": "long"},
+        {"id": 3, "name": "ref", "required": False, "type": "uuid"},
+        {"id": 4, "name": "at", "required": False, "type": "time"},
+        {"id": 5, "name": "amount", "required": False, "type": "decimal(10, 2)"},
+    ]}
+    root = write_iceberg_table(tmp / "t", {"v1.metadata.json": iceberg_metadata([schema], 0)})
+    c = cols(get_iceberg_schema(str(root), "t"))
+    assert c["order_id"]["constraints"]["primary_key"] and c["order_id"]["constraints"]["primary_key_position"] == 1
+    assert c["tenant"]["constraints"]["primary_key_position"] == 2
+    assert c["ref"]["constraints"]["primary_key"] is False and c["ref"]["constraints"]["format"] == "uuid"
+    assert c["at"]["col_type"] == ColumnType.TIME
+    assert c["order_id"]["physical_type"] == "long"
+    assert c["amount"]["physical_type"] == "decimal(10, 2)"
+
+test("identifier-field-ids → primary key; time → TIME; physical types", test_iceberg_identifier_fields_time_physical)
+
+
 def test_iceberg_version_hint(tmp):
     old = iceberg_metadata([ICE_SCHEMA_0], current_id=0)
     root = write_iceberg_table(tmp / "t", {"v1.metadata.json": old, "v2.metadata.json": _ice_v2(),

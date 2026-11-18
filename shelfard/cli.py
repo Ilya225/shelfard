@@ -10,6 +10,9 @@ Usage:
   shelfard iceberg snapshot <table-path> --name NAME
   shelfard iceberg check    <table-path> --name NAME [--update]
   shelfard iceberg list     <warehouse-dir>
+  shelfard odcs export   <name> [--version N] [--format json|yaml] [--out FILE]
+  shelfard odcs import   <contract> [--name-prefix PREFIX]
+  shelfard odcs check    <contract> (--checker NAME | --name NAME) [--object OBJ] [--update]
   shelfard show          <table>
   shelfard list          {schemas,subscriptions}
   shelfard subscribe     <table> --consumer NAME [--columns COL1,COL2,...]
@@ -31,6 +34,7 @@ from shelfard import (
     register_checker, get_checker, get_all_checkers, run_checker,
     set_var, get_var, list_vars, delete_var, accept_safe_update,
 )
+from shelfard import odcs
 from shelfard.models import ChangeSeverity, ChangeType
 from shelfard.registry import _default as _registry
 from shelfard.security import query_template_error
@@ -173,10 +177,22 @@ def _print_schema(schema_dict: dict, indent: int = 0) -> None:
             notes.append(f"max {col['max_length']}")
         if col.get("precision"):
             notes.append(f"precision {col['precision']},{col.get('scale', 0)}")
+        if col.get("physical_type"):
+            notes.append(col["physical_type"])
+        c = col.get("constraints") or {}
+        if c.get("primary_key"):
+            pos = c.get("primary_key_position")
+            notes.append(f"PK{f' #{pos}' if pos else ''}")
+        if c.get("unique"):
+            notes.append("unique")
+        if c.get("format"):
+            notes.append(f"format {c['format']}")
         note_str = f"   ({', '.join(notes)})" if notes else ""
         print(f"  {name:<24} {col_type:<12} {nullable}{note_str}")
         if col.get("fields"):
             _print_schema({"columns": col["fields"]}, indent + 1)
+        elif col.get("items"):
+            _print_schema({"columns": [{**col["items"], "name": "[]"}]}, indent + 1)
 
 
 # ── REST commands ─────────────────────────────────────────────────────────────
@@ -814,6 +830,124 @@ def cmd_var_unset(args) -> int:
 
 # ── Agent command ─────────────────────────────────────────────────────────────
 
+# ── ODCS commands ─────────────────────────────────────────────────────────────
+
+def cmd_odcs_export(args) -> int:
+    result = odcs.export_odcs(args.name, args.version)
+    if not result.success:
+        print(red(f"✗ {result.error}"), file=sys.stderr)
+        return 2
+    fmt = args.format or ("yaml" if args.out and odcs.is_yaml_path(args.out) else "json")
+    try:
+        text = odcs.dumps_contract(result.data["contract"], fmt)
+    except ImportError as e:
+        print(red(f"✗ {e}"), file=sys.stderr)
+        return 2
+    if not args.out:
+        sys.stdout.write(text)
+        return 0
+    with open(args.out, "w", encoding="utf-8") as f:
+        f.write(text)
+    print(green(f"✓ Wrote {args.out}") +
+          f"  (contract version {result.data['contract_version']}, "
+          f"registry version {result.data['version_number']})")
+    return 0
+
+
+def _load_contract_or_report(path):
+    try:
+        return odcs.load_contract(path)
+    except (OSError, ValueError, ImportError) as e:
+        print(red(f"✗ Cannot read contract {path}: {e}"))
+    except Exception as e:     # yaml.YAMLError and friends
+        print(red(f"✗ Cannot parse contract {path}: {e}"))
+    return None
+
+
+def _print_ignored(ignored: dict) -> None:
+    if not ignored:
+        return
+    print(yellow("  Not represented in Shelfard (kept only in the contract):"))
+    for field, paths in sorted(ignored.items()):
+        shown = ", ".join(paths[:3]) + (f", … (+{len(paths) - 3})" if len(paths) > 3 else "")
+        print(f"    • {field}: {shown}")
+
+
+def cmd_odcs_import(args) -> int:
+    doc = _load_contract_or_report(args.contract)
+    if doc is None:
+        return 2
+    result = odcs.import_odcs(doc, name_prefix=args.name_prefix or "")
+    if not result.success:
+        print(red(f"✗ {result.error}"))
+        return 2
+    for entry in result.data["registered"]:
+        print(green(f"✓ Registered '{entry['name']}'") + f"  (version {entry['version_count']})")
+    _print_ignored(result.data["ignored"])
+    return 0
+
+
+def cmd_odcs_check(args) -> int:
+    from shelfard.registry import fetch_checker_schema
+    from shelfard.schema_comparison import compare_schemas
+
+    doc = _load_contract_or_report(args.contract)
+    if doc is None:
+        return 2
+    if args.checker:
+        label = args.checker
+        live = fetch_checker_schema(args.checker)
+    else:
+        label = args.name
+        live = get_registered_schema(args.name)
+    if not live.success:
+        print(red(f"✗ {live.error}"))
+        return 2
+
+    obj = odcs.find_object(doc, args.object, fallback=label)
+    if obj is None:
+        names = [o.get("name") for o in doc.get("schema") or [] if isinstance(o, dict)]
+        print(red(f"✗ No schema object to check in {args.contract}") +
+              f" (objects: {', '.join(map(str, names)) or 'none'}); pass --object NAME.")
+        return 2
+    try:
+        contract_schema = odcs.contract_table(doc, obj)
+    except ValueError as e:
+        print(red(f"✗ {e}"))
+        return 2
+
+    result = compare_schemas(contract_schema, TableSchema.from_dict(live.data["schema"]))
+    if not result.success:
+        print(red(f"✗ {result.error}"))
+        return 2
+    diff = result.data["diff"]
+    version = doc.get("version", "?")
+    _print_diff(f"{label}' vs contract '{obj['name']}", diff, f"contract version {version}")
+    if not diff["changes"]:
+        return 0
+
+    suggestion = diff.get("suggested_update")
+    if not suggestion:
+        if args.update:
+            print(yellow("  --update ignored: only all-SAFE changes are written to the contract."))
+        return 1
+    new_version = odcs.bump_version(version, "patch") or version
+    print(f"  Suggested contract update (version {version} → {new_version}):")
+    for line in suggestion.get("explanation", []):
+        print(f"    • {line}")
+    if not args.update:
+        print("  Run the same command with --update to write it to the contract.")
+        return 1
+    updated = odcs.update_contract(doc, obj["name"], TableSchema.from_dict(suggestion["schema"]))
+    try:
+        odcs.save_contract(updated, args.contract)
+    except (OSError, ImportError) as e:
+        print(red(f"✗ Contract not updated: {e}"))
+        return 2
+    print(green(f"✓ Contract updated: {args.contract} is now version {updated.get('version')}"))
+    return 0
+
+
 def cmd_agent(args) -> int:
     from shelfard.agent import run_agent
     run_agent(model=args.model, allow_writes=args.allow_writes)
@@ -1089,6 +1223,37 @@ def _add_var_subcommands(top) -> None:
     unset_p.set_defaults(func=cmd_var_unset)
 
 
+def _add_odcs_subcommands(top) -> None:
+    odcs_p = top.add_parser("odcs", help="Open Data Contract Standard (ODCS v3.1.0) contracts")
+    odcs_cmds = odcs_p.add_subparsers(dest="command", required=True, metavar="COMMAND")
+
+    exp = odcs_cmds.add_parser("export", help="Export a registered schema as an ODCS contract")
+    exp.add_argument("name", help="Registered schema name")
+    exp.add_argument("--version", type=int, metavar="N",
+                     help="Registry version to export (1-based; default: latest)")
+    exp.add_argument("--format", choices=["json", "yaml"],
+                     help="Output format (default: from --out extension, else json)")
+    exp.add_argument("--out", metavar="FILE", help="Write to FILE instead of stdout")
+    exp.set_defaults(func=cmd_odcs_export)
+
+    imp = odcs_cmds.add_parser("import", help="Register the schema objects of an ODCS contract")
+    imp.add_argument("contract", help="Contract file (.json, .yaml, .yml)")
+    imp.add_argument("--name-prefix", metavar="PREFIX",
+                     help="Prefix for registered schema names")
+    imp.set_defaults(func=cmd_odcs_import)
+
+    chk = odcs_cmds.add_parser("check", help="Compare a live or registered schema with a contract")
+    chk.add_argument("contract", help="Contract file (.json, .yaml, .yml)")
+    src = chk.add_mutually_exclusive_group(required=True)
+    src.add_argument("--checker", metavar="NAME", help="Read the live schema with this stored checker")
+    src.add_argument("--name", metavar="NAME", help="Use the latest registered version of this schema")
+    chk.add_argument("--object", metavar="OBJ",
+                     help="Schema object in the contract (default: the only one, or the one named like the source)")
+    chk.add_argument("--update", action="store_true",
+                     help="When every change is SAFE, write them into the contract (bumps the patch version)")
+    chk.set_defaults(func=cmd_odcs_check)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="shelfard",
@@ -1112,6 +1277,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_iceberg_subcommands(top)
     _add_checker_subcommands(top)
     _add_var_subcommands(top)
+    _add_odcs_subcommands(top)
 
     agent_p = top.add_parser(
         "agent",

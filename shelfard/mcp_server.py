@@ -38,6 +38,8 @@ returned by remote APIs), so every tool input is treated as attacker-controlled:
 * Template variables referenced by an existing checker cannot be changed through
   MCP, so a stored checker (and its credentials) cannot be redirected.
 * All names used in file paths are validated by the registry (path-traversal guard).
+* ODCS is export-only over MCP (``get_schema_odcs``); importing contracts or writing
+  contract files stays a CLI action, so the LLM can't supply schemas or choose paths.
 """
 
 from __future__ import annotations
@@ -124,6 +126,14 @@ def live_check_schema(schema_name: str) -> str:
     When every change is SAFE, the diff includes suggested_update (explanation + next baseline);
     it is applied only through accept_safe_schema_update."""
     return _run_checker(schema_name).to_json()
+
+
+def get_schema_odcs(schema_name: str, version: int | None = None) -> str:
+    """Export a registered schema as an ODCS v3.1.0 data contract (JSON). ``version`` is the
+    1-based registry version (default: latest); the contract version is semver derived from
+    the history (BREAKING → major, WARNING → minor, SAFE → patch)."""
+    from .odcs import export_odcs
+    return export_odcs(schema_name, version).to_json()
 
 
 def get_template_var(name: str) -> str:
@@ -311,7 +321,7 @@ def accept_safe_schema_update(schema_name: str) -> str:
 
 READ_TOOLS = (
     get_schema, get_schemas, get_subscriptions, get_subscription,
-    get_checker_config, live_check_schema, get_template_var, list_template_vars,
+    get_checker_config, live_check_schema, get_schema_odcs, get_template_var, list_template_vars,
 )
 WRITE_TOOLS = (
     register_checker, register_postgres_checker, set_template_var, delete_template_var,

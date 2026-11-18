@@ -23,7 +23,9 @@ class PostgresChecker(Checker):
         self.config = config
         self.registry = registry
 
-    def run(self) -> ToolResult:
+    def fetch(self) -> ToolResult:
+        """Resolve the stored config and read the live schema (no comparison).
+        Returns the reader's ToolResult (data={"schema": {...}, ...})."""
         # 1. Validate that all required env vars are present
         missing = [name for name in self.config.env if name not in os.environ]
         if missing:
@@ -80,6 +82,12 @@ class PostgresChecker(Checker):
                 success=False,
                 error=f"Failed to fetch live schema: {live_result.error}",
             )
+        return live_result
+
+    def run(self) -> ToolResult:
+        live_result = self.fetch()
+        if not live_result.success:
+            return live_result
 
         # 4. Load baseline from registry
         baseline_result = self.registry.get_registered_schema(self.config.schema_name)

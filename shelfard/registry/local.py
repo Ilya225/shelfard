@@ -158,6 +158,22 @@ class LocalFileRegistry(SchemaRegistry):
         except Exception as e:
             return ToolResult(success=False, error=f"Failed to read registry: {e}")
 
+    def get_schema_history(self, table_name: str) -> ToolResult:
+        """All registered versions of a source schema, oldest first."""
+        if invalid := self._invalid_names(table_name=table_name):
+            return invalid
+        path = self._source_path(table_name)
+        if not path.exists():
+            return ToolResult(success=False,
+                              error=f"No registered schema found for '{table_name}'.")
+        try:
+            versions = self._load_json(path)["versions"]
+            history = [TableSchema.from_dict({**v, "table_name": table_name}).to_dict()
+                       for v in versions]
+            return ToolResult(success=True, data={"versions": history})
+        except Exception as e:
+            return ToolResult(success=False, error=f"Failed to read registry: {e}")
+
     def get_all_schemas(self) -> ToolResult:
         """List all source schemas with summary metadata."""
         sources_dir = self._sources_dir()
@@ -430,36 +446,38 @@ class LocalFileRegistry(SchemaRegistry):
                 pass
         return ToolResult(success=True, data={"checkers": result})
 
-    def run_checker(self, schema_name: str) -> ToolResult:
-        """Load the checker config and run the live drift check."""
+    def _build_checker(self, schema_name: str):
+        """Return (checker, None) for a stored config, or (None, error ToolResult)."""
         result = self.get_checker(schema_name)
         if not result.success:
-            return result
+            return None, result
 
         config_dict = result.data["checker"]
         checker_type = config_dict.get("checker_type", "rest")
 
         if checker_type == "rest":
             from ..tools.rest import RestChecker
-            config = RestCheckerConfig.from_dict(config_dict)
-            return RestChecker(config, self).run()
-        elif checker_type == "postgres":
+            return RestChecker(RestCheckerConfig.from_dict(config_dict), self), None
+        if checker_type == "postgres":
             from ..tools.postgres import PostgresChecker
-            config = PostgresCheckerConfig.from_dict(config_dict)
-            return PostgresChecker(config, self).run()
-        elif checker_type == "file":
+            return PostgresChecker(PostgresCheckerConfig.from_dict(config_dict), self), None
+        if checker_type == "file":
             from ..tools.files import FileChecker
-            config = FileCheckerConfig.from_dict(config_dict)
-            return FileChecker(config, self).run()
-        elif checker_type == "iceberg":
+            return FileChecker(FileCheckerConfig.from_dict(config_dict), self), None
+        if checker_type == "iceberg":
             from ..tools.iceberg import IcebergChecker
-            config = IcebergCheckerConfig.from_dict(config_dict)
-            return IcebergChecker(config, self).run()
-        else:
-            return ToolResult(
-                success=False,
-                error=f"Unknown checker type: {checker_type!r}",
-            )
+            return IcebergChecker(IcebergCheckerConfig.from_dict(config_dict), self), None
+        return None, ToolResult(success=False, error=f"Unknown checker type: {checker_type!r}")
+
+    def run_checker(self, schema_name: str) -> ToolResult:
+        """Load the checker config and run the live drift check."""
+        checker, error = self._build_checker(schema_name)
+        return error if error else checker.run()
+
+    def fetch_checker_schema(self, schema_name: str) -> ToolResult:
+        """Run only the fetch half of a stored checker: the live schema, no diff."""
+        checker, error = self._build_checker(schema_name)
+        return error if error else checker.fetch()
 
     # ── Template variables ────────────────────────────────────────────────────
 

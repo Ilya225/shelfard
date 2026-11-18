@@ -97,7 +97,9 @@ def test_postgres_normalize_type():
     assert _normalize_type("timestamp with time zone") == ColumnType.TIMESTAMP
     assert _normalize_type("timestamptz")          == ColumnType.TIMESTAMP
     assert _normalize_type("bpchar")               == ColumnType.VARCHAR
-    assert _normalize_type("uuid")                 == ColumnType.UNKNOWN  # not mapped
+    assert _normalize_type("uuid")                 == ColumnType.VARCHAR  # + format "uuid"
+    assert _normalize_type("time without time zone") == ColumnType.TIME
+    assert _normalize_type("timetz")               == ColumnType.TIME
 
 test("PostgreSQL _normalize_type maps vendor types correctly", test_postgres_normalize_type)
 
@@ -106,13 +108,22 @@ def test_postgres_reader_table_mode():
     """Table mode: information_schema rows → ColumnSchema list with correct types + nullability."""
     from shelfard.tools.postgres.reader import PostgresReader
 
-    # (col_name, data_type, is_nullable, char_max_len, num_precision, num_scale, col_default)
+    # (col_name, data_type, is_nullable, char_max_len, num_precision, num_scale, col_default, udt_name)
     info_rows = [
-        ("id",   "integer",           "NO",  None, 32,   0,    None),
-        ("name", "character varying", "YES", 100,  None, None, None),
-        ("score","numeric",           "NO",  None, 10,   2,    None),
+        ("id",   "integer",           "NO",  None, 32,   0,    None, "int4"),
+        ("name", "character varying", "YES", 100,  None, None, None, "varchar"),
+        ("score","numeric",           "NO",  None, 10,   2,    None, "numeric"),
+        ("ext",  "uuid",              "YES", None, None, None, None, "uuid"),
+        ("tags", "ARRAY",             "YES", None, None, None, None, "_text"),
     ]
-    mock_pg, _ = _make_pg_mock([info_rows])
+    # (column_name, constraint_type, constraint_name, ordinal_position)
+    key_rows = [
+        ("id",   "PRIMARY KEY", "users_pkey",     1),
+        ("ext",  "UNIQUE",      "users_ext_key",  1),
+        ("name", "UNIQUE",      "users_name_score", 1),   # composite: not "unique" per column
+        ("score", "UNIQUE",     "users_name_score", 2),
+    ]
+    mock_pg, _ = _make_pg_mock([info_rows, key_rows])
     with patch("shelfard.tools.postgres.reader.psycopg2", mock_pg):
         result = PostgresReader("postgresql://localhost/test", "users", table="users").get_schema()
 
@@ -130,6 +141,17 @@ def test_postgres_reader_table_mode():
     assert cols["score"]["nullable"]   == False
     assert cols["score"]["precision"]  == 10
     assert cols["score"]["scale"]      == 2
+    # physical types, constraints
+    assert cols["name"]["physical_type"] == "character varying"
+    assert cols["tags"]["physical_type"] == "_text"
+    assert cols["tags"]["col_type"]      == "array"
+    assert cols["ext"]["col_type"]       == "varchar"
+    assert cols["id"]["constraints"]["primary_key"] is True
+    assert cols["id"]["constraints"]["primary_key_position"] == 1
+    assert cols["ext"]["constraints"]["unique"] is True
+    assert cols["ext"]["constraints"]["format"] == "uuid"
+    assert cols["name"]["constraints"]["unique"] is False
+    assert cols["score"]["constraints"] == {**cols["score"]["constraints"], "primary_key": False, "unique": False}
 
 test("PostgresReader table mode: information_schema → ColumnSchemas", test_postgres_reader_table_mode)
 
@@ -156,6 +178,9 @@ def test_postgres_reader_query_all_nonnull():
     cols = {c["name"]: c for c in result.data["schema"]["columns"]}
     assert cols["id"]["nullable"]    == False  # no NULLs → NOT NULL by contract
     assert cols["email"]["nullable"] == False
+    assert cols["id"]["physical_type"] == "int4"   # typname from pg_type
+    assert cols["email"]["physical_type"] == "text"
+    assert cols["id"]["constraints"] is None        # query mode records no key constraints
 
 test("PostgresReader query mode: no NULLs in sample → NOT NULL by contract", test_postgres_reader_query_all_nonnull)
 

@@ -34,6 +34,7 @@ _TYPE_MAP: dict[str, ColumnType] = {
     "timestamp_ltz":    ColumnType.TIMESTAMP,
     "timestamp_ntz":    ColumnType.TIMESTAMP,
     "timestamp_tz":     ColumnType.TIMESTAMP,
+    "time":             ColumnType.TIME,
     "variant":          ColumnType.JSON,
     "object":           ColumnType.JSON,
     "array":            ColumnType.ARRAY,

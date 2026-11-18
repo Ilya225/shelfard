@@ -41,6 +41,25 @@ def _infer_column_type(value) -> ColumnType:
     return ColumnType.UNKNOWN
 
 
+def _json_type(value):
+    """The JSON type of a value — recorded as ``physical_type`` (None for null)."""
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, int):
+        return "integer"
+    if isinstance(value, float):
+        return "number"
+    if isinstance(value, str):
+        return "string"
+    if isinstance(value, list):
+        return "array"
+    if isinstance(value, dict):
+        return "object"
+    return None
+
+
 def _build_column_schema(key: str, value) -> ColumnSchema:
     """Build a ColumnSchema for a single key/value pair.
 
@@ -51,13 +70,16 @@ def _build_column_schema(key: str, value) -> ColumnSchema:
     """
     if isinstance(value, dict):
         nested = [_build_column_schema(k, v) for k, v in value.items()]
-        return ColumnSchema(name=key, col_type=ColumnType.STRUCT, nullable=False, fields=nested)
+        return ColumnSchema(name=key, col_type=ColumnType.STRUCT, nullable=False, fields=nested,
+                            physical_type="object")
     if isinstance(value, list):
         sample = next((v for v in value if v is not None), None)
         items = _build_column_schema("item", sample)
         items.nullable = any(v is None for v in value)  # an empty list says nothing
-        return ColumnSchema(name=key, col_type=ColumnType.ARRAY, nullable=False, items=items)
-    return ColumnSchema(name=key, col_type=_infer_column_type(value), nullable=(value is None))
+        return ColumnSchema(name=key, col_type=ColumnType.ARRAY, nullable=False, items=items,
+                            physical_type="array")
+    return ColumnSchema(name=key, col_type=_infer_column_type(value), nullable=(value is None),
+                        physical_type=_json_type(value))
 
 
 def _load_json_object(file_path: str) -> ToolResult:

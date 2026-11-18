@@ -35,6 +35,12 @@ class SchemaReader(ABC):
 
 
 class Checker(ABC):
+    def fetch(self) -> ToolResult:
+        """Read the live schema without comparing it (data={"schema": {...}}).
+        Used by ODCS contract checks; built-in checkers all implement it."""
+        return ToolResult(success=False,
+                          error=f"{type(self).__name__} does not support fetching the live schema.")
+
     @abstractmethod
     def run(self) -> ToolResult:
         """

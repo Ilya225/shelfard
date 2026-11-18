@@ -166,6 +166,22 @@ def test_avro_types(tmp):
 test("container header: types, unions, named refs, logical types, defaults", test_avro_types)
 
 
+def test_avro_time_and_physical_types(tmp):
+    schema = {"type": "record", "name": "R", "fields": [
+        {"name": "at", "type": {"type": "int", "logicalType": "time-millis"}},
+        {"name": "ref", "type": ["null", {"type": "string", "logicalType": "uuid"}]},
+        {"name": "n", "type": "long"},
+        {"name": "status", "type": {"type": "enum", "name": "S", "symbols": ["A"]}},
+    ]}
+    c = cols(get_file_schema(str(write_avro(tmp / "r.avro", schema)), "r"))
+    assert c["at"]["col_type"] == ColumnType.TIME and c["at"]["physical_type"] == "time-millis"
+    assert c["ref"]["physical_type"] == "uuid" and c["ref"]["constraints"]["format"] == "uuid"
+    assert c["n"]["physical_type"] == "long" and c["n"]["constraints"] is None
+    assert c["status"]["physical_type"] == "enum"
+
+test("Avro time-* → TIME; physical types; uuid format", test_avro_time_and_physical_types)
+
+
 def test_avro_negative_block_count(tmp):
     p = write_avro(tmp / "o.avro", ORDERS_AVRO, negative_block_count=True)
     assert "order_id" in cols(get_file_schema(str(p), "orders"))
@@ -288,6 +304,23 @@ def test_parquet_file(tmp):
     assert c["raw"]["col_type"] == ColumnType.UNKNOWN
 
 test("Parquet file: types, nested struct, required/optional", test_parquet_file, requires_pyarrow=True)
+
+
+def test_parquet_time_and_physical_types(tmp):
+    t = pa.table({"at": pa.array([1000], pa.time32("ms")), "n": pa.array([1], pa.int64()),
+                  "s": pa.array(["x"], pa.string()),
+                  "st": pa.array([{"a": 1}], pa.struct([pa.field("a", pa.int64())])),
+                  "l": pa.array([[1]], pa.list_(pa.int64())),
+                  "d": pa.array(["x"]).dictionary_encode()})
+    pq.write_table(t, tmp / "t.parquet")
+    c = cols(get_file_schema(str(tmp / "t.parquet"), "t"))
+    assert c["at"]["col_type"] == ColumnType.TIME and c["at"]["physical_type"] == "time32[ms]"
+    assert c["n"]["physical_type"] == "int64" and c["s"]["physical_type"] == "string"
+    assert c["st"]["physical_type"] == "struct" and c["l"]["physical_type"] == "list"
+    assert c["d"]["physical_type"] == "string"          # dictionary encoding is not schema
+
+test("Parquet time → TIME; Arrow type string as physical type", test_parquet_time_and_physical_types,
+     requires_pyarrow=True)
 
 
 def test_parquet_hive_partitioned(tmp):

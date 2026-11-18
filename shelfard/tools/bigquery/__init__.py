@@ -21,6 +21,7 @@ _TYPE_MAP: dict[str, ColumnType] = {
     "date":       ColumnType.DATE,
     "datetime":   ColumnType.TIMESTAMP,
     "timestamp":  ColumnType.TIMESTAMP,
+    "time":       ColumnType.TIME,
     "json":       ColumnType.JSON,
     "array":      ColumnType.ARRAY,
     "struct":     ColumnType.JSON,

@@ -52,6 +52,8 @@ def _normalize_type(t) -> tuple[ColumnType, dict]:
         return ColumnType.DATE, {}
     if types.is_timestamp(t):
         return ColumnType.TIMESTAMP, {}
+    if types.is_time(t):
+        return ColumnType.TIME, {}
     if types.is_struct(t):
         return ColumnType.STRUCT, {"fields": [_column(t.field(i)) for i in range(t.num_fields)]}
     if types.is_map(t):
@@ -60,7 +62,7 @@ def _normalize_type(t) -> tuple[ColumnType, dict]:
     if types.is_list(t) or types.is_large_list(t) or types.is_fixed_size_list(t) \
             or _is(types, "is_list_view", t) or _is(types, "is_large_list_view", t):
         return ColumnType.ARRAY, {}
-    # binary, time, duration, interval, null, union, extension types, ...
+    # binary, duration, interval, null, union, extension types, ...
     return ColumnType.UNKNOWN, {}
 
 
@@ -72,7 +74,23 @@ def _is(types, predicate: str, t) -> bool:
 
 def _column(field) -> ColumnSchema:
     col_type, extra = _normalize_type(field.type)
-    return ColumnSchema(name=field.name, col_type=col_type, nullable=field.nullable, **extra)
+    return ColumnSchema(name=field.name, col_type=col_type, nullable=field.nullable,
+                        physical_type=_physical_type(field.type), **extra)
+
+
+def _physical_type(t) -> str:
+    """Arrow type as text. Structs and lists record only their kind (``struct``,
+    ``large_list``) — their contents are compared field by field; dictionary
+    encoding is a storage detail, so the value type is recorded."""
+    types = _require_pyarrow().types
+    if types.is_dictionary(t):
+        return _physical_type(t.value_type)
+    text = str(t)
+    if types.is_struct(t) or types.is_list(t) or types.is_large_list(t) \
+            or types.is_fixed_size_list(t) or _is(types, "is_list_view", t) \
+            or _is(types, "is_large_list_view", t):
+        return text.split("<", 1)[0]
+    return text
 
 
 def arrow_schema_to_columns(schema) -> list[ColumnSchema]:

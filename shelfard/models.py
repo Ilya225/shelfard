@@ -27,10 +27,62 @@ class ColumnType(str, Enum):
     BOOLEAN   = "boolean"
     DATE      = "date"
     TIMESTAMP = "timestamp"
+    TIME      = "time"                     # time of day, no date
     JSON      = "json"
     ARRAY     = "array"
     STRUCT    = "struct"
     UNKNOWN   = "unknown"
+
+
+@dataclass
+class ColumnConstraints:
+    """Declared constraints on a column — mirrors ODCS property flags and
+    ``logicalTypeOptions``. ``max_length`` stays on ColumnSchema (it is part of
+    the type).
+
+    Every attribute is tri-state: ``None`` means unknown (not observable by the
+    reader / not stated by the contract) and is never compared; ``False`` or a
+    value is an observed fact. E.g. the Postgres reader sets ``primary_key`` to
+    True/False for every column, while a pattern is always ``None`` for it.
+
+    ``minimum``/``maximum``/``exclusive_*`` are numbers for numeric columns and
+    ISO strings for date/time columns. ``format`` is a semantic string format
+    (``uuid``, ``email``, ``uri``, ...).
+    """
+    primary_key: Optional[bool] = None
+    primary_key_position: Optional[int] = None   # 1-based position in a composite key
+    unique: Optional[bool] = None
+    format: Optional[str] = None
+    pattern: Optional[str] = None
+    minimum: Optional[object] = None
+    maximum: Optional[object] = None
+    exclusive_minimum: Optional[object] = None
+    exclusive_maximum: Optional[object] = None
+    multiple_of: Optional[float] = None
+    min_length: Optional[int] = None
+    min_items: Optional[int] = None
+    max_items: Optional[int] = None
+    unique_items: Optional[bool] = None
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+    def known(self) -> dict:
+        """Only the attributes that have a value (True/False included)."""
+        return {k: v for k, v in asdict(self).items() if v is not None}
+
+    @classmethod
+    def from_dict(cls, d: Optional[dict]) -> Optional["ColumnConstraints"]:
+        """Build from a dict; returns None when no attribute has a value."""
+        if not d:
+            return None
+        known = cls.__dataclass_fields__
+        c = cls(**{k: v for k, v in d.items() if k in known})
+        return c if c.known() else None
+
+
+def _known(c: Optional[ColumnConstraints]) -> dict:
+    return c.known() if c is not None else {}
 
 
 @dataclass
@@ -45,6 +97,8 @@ class ColumnSchema:
     description: Optional[str] = None
     fields: Optional[list[ColumnSchema]] = field(default=None)  # sub-fields for STRUCT columns
     items: Optional[ColumnSchema] = None   # element schema for ARRAY columns (None = not recorded)
+    physical_type: Optional[str] = None    # raw vendor type, e.g. "character varying", "int64" (None = not recorded)
+    constraints: Optional[ColumnConstraints] = None  # None = nothing known (see ColumnConstraints)
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -59,7 +113,9 @@ class ColumnSchema:
             self.precision == other.precision and
             self.scale == other.scale and
             self.fields == other.fields and
-            self.items == other.items
+            self.items == other.items and
+            self.physical_type == other.physical_type and
+            _known(self.constraints) == _known(other.constraints)
         )
 
     @classmethod
@@ -89,6 +145,8 @@ class ColumnSchema:
             description=col.get("description"),
             fields=nested,
             items=items,
+            physical_type=col.get("physical_type"),
+            constraints=ColumnConstraints.from_dict(col.get("constraints")),
         )
 
 
@@ -184,6 +242,8 @@ class ChangeType(str, Enum):
     TYPE_RESOLVED       = "type_resolved"      # UNKNOWN → concrete type (e.g. a field first seen as null)
     PARTITION_CHANGED   = "partition_changed"  # partition keys / transforms changed
     CLUSTERING_CHANGED  = "clustering_changed" # clustering / sort keys changed
+    PHYSICAL_TYPE_CHANGED = "physical_type_changed"  # same normalized type, different vendor type
+    CONSTRAINT_CHANGED  = "constraint_changed"  # primary key / unique / range / pattern / ... changed
 
 
 @dataclass

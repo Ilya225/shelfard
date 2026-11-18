@@ -24,6 +24,9 @@ pip install shelfard[postgres]
 
 # With Parquet / ORC support (pyarrow). Avro and Iceberg need no extra.
 pip install shelfard[files]
+
+# ODCS contracts as YAML + JSON Schema validation (JSON contracts need no extra)
+pip install shelfard[odcs]
 ```
 
 ### Homebrew
@@ -129,6 +132,8 @@ $ shelfard rest check https://api.example.com/users/1 --name users --update
 ```
 
 `--update` never applies WARNING or BREAKING drift — review those and re-snapshot to accept them. The update is refused if someone re-snapshotted since the check ran.
+
+**Physical types and constraints.** Besides the normalized type, every reader records the source's own type (`physical_type`: `timestamp with time zone`, `int64`, `decimal(10, 2)`, the JSON type for REST payloads). Where the source can tell, it also records constraints: primary keys and single-column UNIQUE for PostgreSQL tables and SQLite, Iceberg identifier fields, and `format: uuid`. A different physical type with the same normalized type (e.g. `timestamptz` → `timestamp`) is a WARNING, and so is any constraint change (primary key removed, unique added, …). Each is compared only when both versions know it, so baselines saved before these fields existed report no extra drift.
 
 **REST / JSON payloads are samples.** A schema inferred from one response says what that response looked like, so for these sources: a `null` value doesn't erase a known type (the baseline keeps it and marks the field nullable); a field that happens to be non-null isn't treated as NOT NULL; new fields are SAFE; key order is ignored; and array element types are tracked (`tags[]`, `tags[].x`).
 
@@ -490,6 +495,30 @@ Checkers (3):
 
 ---
 
+## CLI — ODCS data contracts
+
+Shelfard can exchange schemas as [Open Data Contract Standard](https://bitol-io.github.io/open-data-contract-standard/v3.1.0/) (ODCS v3.1.0) documents. The registry keeps its own format; ODCS is used for export, import and for checking a source against a contract.
+
+```bash
+# Export a registered schema (latest or --version N) — JSON to stdout, or YAML/JSON by --out extension
+shelfard odcs export orders --out orders.odcs.yaml
+
+# Register every schema object of a contract (prints the ODCS fields Shelfard can't represent)
+shelfard odcs import orders.odcs.yaml --name-prefix contract_
+
+# Compare a live source (through a stored checker) or a registered schema with a contract
+shelfard odcs check orders.odcs.yaml --checker orders
+shelfard odcs check orders.odcs.yaml --name orders --object orders --update
+```
+
+- **Lossless for Shelfard's own contracts.** Types, nullability (`required`), max length, constraints (`primaryKey`, `unique`, `logicalTypeOptions`), physical types, nested `properties` / `items` and partition keys use native ODCS fields. What ODCS can't express (exact type such as TEXT vs VARCHAR or DECIMAL precision, defaults, clustering keys, Iceberg partition transforms) is kept in `customProperties` named `shelfard.*`.
+- **Versions.** The contract `version` is semver derived from the registry history: version 1 is `1.0.0`, and each later version bumps by its diff against the previous one — BREAKING → major, WARNING → minor, SAFE → patch. The contract `id` is stable per schema name.
+- **Contracts written by hand or by other tools** are read from their native fields. Their `physicalType` strings (`VARCHAR(2)`) are free-form and not compared, and only the constraints a contract states are checked — a `pattern` in the contract is never compared against a database that can't observe patterns.
+- **`odcs check --update`** writes only all-SAFE changes, and only into `schema[].properties`. Everything else stays as-is: `team`, `quality`, `slaProperties`, classifications, examples, your own custom properties, and the contract's property order (new properties go where the source has them). It bumps the patch version. YAML comments are not preserved.
+- Exit codes match the other `check` commands (0 no drift or update written, 1 drift, 2 error).
+
+---
+
 ## CLI — Template variables
 
 Store repeated non-sensitive config values (hosts, base URLs, ports) once and reference them as `{{var_name}}` in checker configs and snapshot commands. This is distinct from `$ENV_VAR` — template variables are stored in the registry and are not secrets.
@@ -644,7 +673,7 @@ Agent: The posts schema has 4 columns:
 You: exit
 ```
 
-The agent has access to the Shelfard MCP read tools — `get_schemas`, `get_schema` (includes checker info), `get_subscriptions`, `get_subscription`, `get_checker_config`, `live_check_schema`, `get_template_var`, `list_template_vars` — plus, with `--allow-writes`, `register_checker`, `register_postgres_checker`, `set_template_var`, `delete_template_var`, and `accept_safe_schema_update`.
+The agent has access to the Shelfard MCP read tools — `get_schemas`, `get_schema` (includes checker info), `get_subscriptions`, `get_subscription`, `get_checker_config`, `live_check_schema`, `get_schema_odcs`, `get_template_var`, `list_template_vars` — plus, with `--allow-writes`, `register_checker`, `register_postgres_checker`, `set_template_var`, `delete_template_var`, and `accept_safe_schema_update`.
 
 ---
 
@@ -671,6 +700,7 @@ The server runs over **stdio** (the MCP standard for local tools). It exposes ei
 | ✎ `register_postgres_checker(schema_name, dsn, table, db_schema, env)` | Register a **new** PostgreSQL checker (table mode only — no custom SQL) |
 | `get_checker_config(schema_name)` | Retrieve the stored checker config (url, env vars, headers) |
 | `live_check_schema(schema_name)` | Run the registered checker against the live endpoint and return the drift result (with `suggested_update` when every change is SAFE) |
+| `get_schema_odcs(schema_name, version?)` | Export a registered schema as an ODCS v3.1.0 contract (semver from the history). Export only — contracts are imported and written from the CLI |
 | ✎ `accept_safe_schema_update(schema_name)` | Re-run the checker and, only if every change is SAFE, save the suggested schema as the next baseline version |
 | ✎ `set_template_var(name, value)` | Store a named template variable for use as `{{name}}` in checker configs and snapshot commands |
 | `get_template_var(name)` | Retrieve a stored template variable by name |
@@ -763,7 +793,7 @@ Change classification is fully deterministic — no LLM involved for clear-cut c
 | Severity | Examples |
 |----------|---------|
 | `SAFE` | Nullable column added, type widened (`int` → `bigint`, `varchar(50)` → `varchar(200)`) |
-| `WARNING` | Column reordered, default value changed |
+| `WARNING` | Column reordered, default value changed, physical type changed (same normalized type), constraint changed (primary key, unique, …) |
 | `BREAKING` | Column removed, type narrowed, `NOT NULL` column added without a default |
 
 ---

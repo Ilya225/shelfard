@@ -29,6 +29,8 @@ postgres = ["psycopg2-binary>=2.9"]
 # Parquet and ORC (Avro and Iceberg are read with the stdlib)
 files = ["pyarrow>=18"]
 ollama = ["langchain-ollama>=1.0"]
+# ODCS contracts: YAML read/write and JSON Schema validation (JSON works without them)
+odcs = ["pyyaml>=6", "jsonschema>=4.18"]
 
 [project.urls]
 Homepage = "https://github.com/Ilya225/shelfard"
