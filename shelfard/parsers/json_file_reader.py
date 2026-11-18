@@ -11,7 +11,7 @@ implement the SchemaReader ABC.
 import json
 import os
 import re
-from datetime import datetime
+from datetime import datetime, timezone
 
 from ..models import ColumnSchema, ColumnType, TableSchema, ToolResult
 from ..registry import register_schema
@@ -82,7 +82,7 @@ def _build_table_schema(obj: dict, schema_name: str) -> TableSchema:
         table_name=schema_name,
         columns=columns,
         source="json_file",
-        captured_at=datetime.utcnow().isoformat(),
+        captured_at=datetime.now(timezone.utc).isoformat(),
     )
 
 

@@ -17,112 +17,10 @@ Layered design — each layer is deterministic and agent-ready:
 - **Layer 2 — Comparison** (`shelfard/schema_comparison.py`): Pure deterministic diffing, produces self-documenting `SchemaDiff`
 - **Layer 2 — Checkers** (`shelfard/tools/*/checker.py`): Stored run configurations for drift checks. Two checker types are supported: `RestCheckerConfig` (URL + headers with `$VAR` placeholders and/or `{{var}}` template vars) and `PostgresCheckerConfig` (DSN with `$VAR` placeholders and/or `{{var}}` template vars + table or custom SQL query). Resolution order at `Checker.run()` time: `{{template_vars}}` from registry first, then `$ENV_VARS` from `os.environ`. `LocalFileRegistry.run_checker()` dispatches to the correct `Checker` subclass via the stored `checker_type` field.
 - **Layer 2 — Template Variables** (`shelfard/registry/`): Persistent key-value store for non-sensitive config values (hosts, base URLs, ports). Stored in `schemas/vars.json`. Referenced as `{{var_name}}` in checker configs and snapshot CLI commands. Managed via `shelfard var set/get/list/unset` or the MCP tools `set_template_var`, `get_template_var`, `list_template_vars`, `delete_template_var`. Distinct from `$ENV_VAR` (secrets, not stored).
-- **Layer 3 — MCP Server** (`shelfard/mcp_server.py`): Standalone FastMCP server built by `build_server(allow_writes)`, stdio transport. Read tools (always): `get_schema` (includes checker info if registered), `get_schemas`, `get_subscriptions`, `get_subscription`, `get_checker_config`, `live_check_schema`, `get_template_var`, `list_template_vars`. Write tools (only with `--allow-writes` / `SHELFARD_MCP_ALLOW_WRITES=1`): `register_checker`, `set_template_var`, `delete_template_var`. Any MCP client (Claude Desktop, Cursor, etc.) can connect directly. See **MCP security model** below.
-- **Layer 3 — Agent** (`shelfard/agent.py`): Interactive LangChain 1.x assistant; spawns the MCP server as a subprocess via `MultiServerMCPClient` and gets its tools from there. Supports Claude, OpenAI, and local Ollama models (`langchain-ollama`, optional extra); model resolved via `--model` flag (`anthropic`, `openai`, `ollama`, `ollama:<model>`, or a model ID) or env-var auto-detection (`ANTHROPIC_API_KEY` → `OPENAI_API_KEY` → `OLLAMA_MODEL`). Read-only by default; `--allow-writes` spawns the server with write tools. The subprocess env only receives `SHELFARD_*` vars and names in `SHELFARD_MCP_ENV_ALLOWLIST` (LLM API keys are never forwarded).
+- **Layer 3 — MCP Server** (`shelfard/mcp_server.py`): Standalone FastMCP server built by `build_server(allow_writes)`, stdio transport. Read tools (always): `get_schema` (includes checker info if registered), `get_schemas`, `get_subscriptions`, `get_subscription`, `get_checker_config`, `live_check_schema`, `get_template_var`, `list_template_vars`. Write tools (only with `--allow-writes` / `SHELFARD_MCP_ALLOW_WRITES=1`): `register_checker`, `register_postgres_checker` (table mode only), `set_template_var`, `delete_template_var`. Any MCP client (Claude Desktop, Cursor, etc.) can connect directly. See **MCP security model** below.
+- **Layer 3 — Agent** (`shelfard/agent.py`): Interactive LangChain 1.x assistant; spawns the MCP server as a subprocess via `MultiServerMCPClient` and gets its tools from there. Supports Claude, OpenAI, and local Ollama models (`langchain-ollama`, optional extra); model resolved via `--model` flag (`anthropic`, `openai`, `ollama`, `ollama:<model>`, or a model ID) , then `SHELFARD_DEFAULT_MODEL`, then env-var auto-detection (`ANTHROPIC_API_KEY` → `OPENAI_API_KEY` → `OLLAMA_MODEL`). Defaults: `claude-sonnet-5-5`, `gpt-5`, `qwen2.5:7b`. `build_agent()` adds `SummarizationMiddleware` (bounded memory; `/reset` starts a new thread) and, with `--allow-writes`, `HumanInTheLoopMiddleware` so every write tool call needs interactive y/N approval (`run_turn()` / `review_tool_calls()` handle the interrupts). The subprocess env receives `SHELFARD_*` vars, names in `SHELFARD_MCP_ENV_ALLOWLIST`, and env names declared by CLI-registered checkers; LLM API keys (`_NEVER_FORWARD`) are never forwarded.
 - **Future layers** (planned): Autonomous remediation suggestions, background drift monitoring, consumer-aware alerting
 
-All tools return `ToolResult` with: `success`, `data`, `error`, `next_action_hint`.
-
----
-
-## CLI Commands
-
-| Command | Description |
-|---|---|
-| `shelfard rest snapshot <url> --name NAME [--create-checker]` | Fetch a REST endpoint and save its schema as a baseline; `--create-checker` also registers a checker from the same URL/headers (auto-extracts `$VAR` refs into `env`) |
-| `shelfard rest check <url> --name NAME` | Fetch and diff against the saved baseline; exit `1` on drift |
-| `shelfard postgres snapshot --dsn DSN --name NAME [--table TABLE \| --query SQL] [--create-checker]` | Read a PostgreSQL table or query result and save its schema as a baseline; `--create-checker` also registers a checker from the same DSN/table/query (auto-extracts `$VAR` refs into `env`) |
-| `shelfard postgres check --dsn DSN --name NAME [--table TABLE \| --query SQL]` | Read and diff against the saved baseline; exit `1` on drift |
-| `shelfard show <table>` | Display a registered schema; also shows checker type if one is registered |
-| `shelfard list schemas` | List all registered source schemas (name, columns, versions, source, latest version) |
-| `shelfard list subscriptions` | List all consumer subscriptions across all tables |
-| `shelfard subscribe <table> --consumer NAME [--columns COL1,COL2,...]` | Subscribe a consumer to a schema (full or projected) |
-| `shelfard checker register <name> --url URL [--header KEY=VALUE ...] [--env VAR ...]` | Register a REST drift-check config for a schema (default `--type rest`) |
-| `shelfard checker register <name> --type postgres --dsn DSN [--table TABLE \| --query SQL] [--env VAR ...]` | Register a PostgreSQL drift-check config for a schema |
-| `shelfard checker run <name>` | Run the registered checker (REST or PostgreSQL); exit `1` on drift |
-| `shelfard checker show <name>` | Display the stored checker config (type-aware: url/headers for REST, dsn/table/query for PostgreSQL) |
-| `shelfard checker list` | List all registered checkers |
-| `shelfard var set <name> <value>` | Store a named template variable (plain text, non-sensitive) for use as `{{name}}` in checker configs and snapshot commands |
-| `shelfard var get <name>` | Show a stored template variable's value |
-| `shelfard var list` | List all stored template variables |
-| `shelfard var unset <name>` | Delete a stored template variable |
-| `shelfard agent [--model MODEL] [--allow-writes]` | Interactive schema assistant; spawns MCP server internally; auto-detects Claude, OpenAI, or Ollama (`OLLAMA_MODEL`) from env; `--model ollama:<model>` for a local model; read-only unless `--allow-writes` |
-| `shelfard mcp [--allow-writes]` | Start the MCP server (stdio transport) — for use with Claude Desktop, Cursor, or any MCP client; write tools only with `--allow-writes` |
-
-Exit codes: `0` = success / no drift, `1` = drift detected, `2` = error.
-
----
-
-## File Map
-
-```
-Shelfard/
-├── shelfard/                        # Python package — all source lives here
-│   ├── __init__.py               # Re-exports all public symbols
-│   ├── models.py                 # Core data structures: ColumnSchema, TableSchema, ConsumerSubscription, SchemaDiff, RestCheckerConfig, PostgresCheckerConfig, etc.
-│   ├── cli.py                    # CLI entry point — show, list, subscribe, rest snapshot/check, postgres snapshot/check, checker, var, agent
-│   ├── registry/                 # Pluggable registry package
-│   │   ├── __init__.py           # Re-exports + _default LocalFileRegistry instance (backward-compat shims)
-│   │   ├── base.py               # SchemaRegistry ABC — 16 methods (source schemas, subscriptions, impact analysis, checkers, template vars); concrete resolve_template()
-│   │   ├── local.py              # LocalFileRegistry(registry_dir=None) — file-based implementation
-│   │   ├── s3.py                 # S3Registry(bucket, prefix) — stub
-│   │   ├── gcs.py                # GCSRegistry(bucket, prefix) — stub
-│   │   └── sql.py                # SQLRegistry(connection_string) — stub
-│   ├── mcp_server.py             # FastMCP server — build_server(allow_writes); read tools always, write tools (register_checker, set/delete_template_var) only with --allow-writes; guarded write tools (stdio)
-│   ├── agent.py                  # run_agent(model, allow_writes) async REPL — spawns MCP server via MultiServerMCPClient, supports Claude + OpenAI + Ollama
-│   ├── security.py               # validate_name (path traversal), validate_var_name, ensure_within, check_env_allowed (MCP env allowlist), check_url_safe (SSRF), extract_env_refs
-│   ├── schema_comparison.py      # Layer 2: Diff schemas, classify changes by severity
-│   ├── type_normalizer.py        # Vendor-agnostic utilities: TYPE_WIDENING_RULES, is_safe_widening, extract_length
-│   ├── tools/                    # Vendor tools — reader + checker co-located per vendor
-│   │   ├── __init__.py           # Re-exports SchemaReader, Checker, and all vendor classes/functions
-│   │   ├── base.py               # SchemaReader ABC (get_schema(), list_tables()) + Checker ABC (run())
-│   │   ├── sql/                  # Shared DB-API 2.0 utilities (reusable by PostgreSQL, MySQL, etc.)
-│   │   │   └── base.py           # sample_query, build_columns_from_query_result, introspect_table_via_information_schema
-│   │   ├── sqlite/
-│   │   │   └── __init__.py       # _TYPE_MAP + SQLiteReader(db_path, table_name) + get_sqlite_schema, list_sqlite_tables
-│   │   ├── rest/
-│   │   │   ├── __init__.py       # Re-exports RestEndpointReader, get_rest_schema, RestChecker
-│   │   │   ├── reader.py         # RestEndpointReader(url, schema_name, *, bearer_token=, headers=) + get_rest_schema
-│   │   │   └── checker.py        # RestChecker — env var resolution, fetch via RestEndpointReader, diff
-│   │   ├── postgres/
-│   │   │   ├── __init__.py       # Re-exports PostgresReader, get_postgres_schema, list_postgres_tables, PostgresChecker
-│   │   │   ├── reader.py         # PostgresReader(dsn, schema_name, *, table=, query=, db_schema=, sample_size=) — two modes; get_postgres_schema, list_postgres_tables. Lazy psycopg2 import.
-│   │   │   └── checker.py        # PostgresChecker — env var resolution, $VAR substitution in DSN/query, fetch via PostgresReader, diff
-│   │   ├── bigquery/
-│   │   │   └── __init__.py       # _TYPE_MAP + _normalize_type (reader implementation pending)
-│   │   └── snowflake/
-│   │       └── __init__.py       # _TYPE_MAP + _normalize_type (reader implementation pending)
-│   └── parsers/                  # Document parsers — not live sources, no SchemaReader ABC
-│       ├── __init__.py           # Re-exports all parser functions
-│       ├── json_reader.py        # get_schema_from_json (dict → TableSchema deserializer)
-│       └── json_file_reader.py   # infer_schema_from_json_file, read_and_register_json_file
-├── tests/
-│   ├── rest_tests.py             # 7 REST integration tests (mock HTTP server, no real network)
-│   ├── postgresql_tests.py       # 12 PostgreSQL reader + checker tests (mocked psycopg2)
-│   ├── registry_tests.py         # 10 schema registry + consumer subscription tests
-│   ├── parsers_tests.py          # 12 JSON file reader + STRUCT inference tests
-│   ├── vars_tests.py             # 16 template variable storage + {{var}} resolution tests
-│   ├── security_tests.py         # 24 path-traversal, MCP write gating, env allowlist, SSRF, tamper-guard tests
-│   └── agent_tests.py            # 20 model resolution (incl. Ollama), LLM construction, MCP subprocess wiring tests
-├── docker/
-│   ├── Dockerfile.test           # Smoke test image — fresh pip install + all CLI commands on every `docker run`
-│   ├── Dockerfile.playground     # Interactive sandbox — shelfard pre-installed, registry pre-seeded
-│   └── test.sh                   # Entrypoint script for Dockerfile.test
-├── docs/
-│   └── test.md                   # Testing guide: unit tests, integration tests, CI, Docker images
-├── .github/workflows/
-│   └── python-package-conda.yml  # CI: pip install + flake8 + run_tests.py + test_rest_reader.py on every push/PR
-├── .dockerignore                 # Excludes schemas/, egg-info, caches from Docker build context
-├── pyproject.toml                # Packaging metadata and entry point (shelfard = "shelfard.cli:main")
-├── Formula/shelfard.rb           # Homebrew formula (copy to homebrew-shelfard tap repo to publish)
-├── run_tests.py                  # 25 basic unit tests: SQLite introspection, schema comparison, STRUCT drift (no external test framework)
-├── schemas/                      # File-based registry root (auto-created on first write)
-│   ├── sources/                  # Versioned source schema files — one JSON per table
-│   ├── consumers/                # Consumer subscriptions — one JSON per consumer/table pair
-│   ├── checkers/                 # Checker configs — one JSON per schema (not versioned, always overwrites)
-│   └── vars.json                 # Template variables — flat dict {name: value} (not versioned, always overwrites)
-└── CLAUDE.md
-```
 
 Importing: `from shelfard import ColumnSchema, get_sqlite_schema, compare_schemas, get_all_schemas, LocalFileRegistry, subscribe_consumer, ...`
 
@@ -156,39 +54,7 @@ Each vendor's raw-type-to-`ColumnType` mapping lives exclusively in its own read
 ## Tech Stack
 
 - **Language**: Python 3.12 (conda env: `shelfard`)
-- **Dependencies**: `requests` (REST reader), `langchain` + `langchain-anthropic` + `langchain-openai` (agent), `mcp` + `langchain-mcp-adapters` (MCP server + client); all other code is stdlib. Declared in `pyproject.toml` with security floors (`langchain-core>=1.2.16`, `langgraph-checkpoint>=4.0.1`; `mcp<2`). Optional: `psycopg2-binary>=2.9` for PostgreSQL (`pip install shelfard[postgres]`), `langchain-ollama>=1.0` for local Ollama models (`pip install shelfard[ollama]`).
 - **Supported sources**: SQLite, REST API endpoints, PostgreSQL (table/view introspection + custom SQL queries); Snowflake, BigQuery (type maps only, readers pending)
-
-### Running tests
-```bash
-# Basic unit tests (25): SQLite introspection, schema comparison, STRUCT drift
-conda run -n shelfard python3 run_tests.py
-
-# Domain-specific tests (run independently):
-conda run -n shelfard python3 tests/registry_tests.py    # 10 tests: registry + consumer subscriptions
-conda run -n shelfard python3 tests/parsers_tests.py     # 12 tests: JSON file reader + STRUCT inference
-conda run -n shelfard python3 tests/rest_tests.py        # 7 tests: REST reader (mock HTTP server, no real network)
-conda run -n shelfard python3 tests/postgresql_tests.py  # 12 tests: PostgreSQL reader + checker (mocked psycopg2)
-conda run -n shelfard python3 tests/vars_tests.py        # 16 tests: template variable storage + {{var}} resolution
-conda run -n shelfard python3 tests/security_tests.py    # 24 tests: path traversal, MCP write gating, env allowlist, SSRF
-conda run -n shelfard python3 tests/agent_tests.py       # 20 tests: model resolution (incl. Ollama), MCP subprocess wiring
-```
-
-### Docker — smoke test (rerunnable, fresh install each time)
-```bash
-docker build -f docker/Dockerfile.test -t shelfard-test .
-docker run --rm shelfard-test
-```
-
-### Docker — interactive playground (pre-seeded registry)
-```bash
-docker build -f docker/Dockerfile.playground -t shelfard-playground .
-docker run --rm -it shelfard-playground
-```
-
-See `docs/test.md` for the full testing guide.
-
----
 
 ## Core Data Models
 
@@ -228,12 +94,14 @@ See `docs/test.md` for the full testing guide.
 - `SchemaRegistry` is an ABC — swap backends by instantiating a different class; module-level functions delegate to a `LocalFileRegistry` default instance
 - `LocalFileRegistry` storage: `schemas/sources/<table>.json` (versioned list), `schemas/consumers/<consumer>/<table>.json` (versioned list), `schemas/checkers/<schema>.json` (single dict, always overwritten), `schemas/vars.json` (flat dict, always overwritten)
 - Checker env vars: resolved from `os.environ` at `Checker.run()` time; never stored as values. Use `$VAR_NAME` in url/header values (REST) or dsn/query (PostgreSQL); list the name in `env`. `LocalFileRegistry.run_checker()` dispatches to `RestChecker` or `PostgresChecker` based on `checker_type`.
-- Template variables (`{{var_name}}`): non-sensitive config values (hosts, base URLs) stored in `schemas/vars.json` via `set_var`/`get_var`/`list_vars`/`delete_var`. Resolved in checker URL/DSN/headers and snapshot CLI args **before** `$ENV_VAR` substitution. Name format: `[a-zA-Z_][a-zA-Z0-9_]*`. Unknown `{{vars}}` left as-is (no error). `SchemaRegistry.resolve_template(template)` is a concrete base-class method — no need to override in new backends.
+- Template variables (`{{var_name}}`): non-sensitive config values (hosts, base URLs) stored in `schemas/vars.json` via `set_var`/`get_var`/`list_vars`/`delete_var`. Resolved in checker URL/DSN/headers and snapshot CLI args **before** `$ENV_VAR` substitution. **Never allowed in SQL queries** (`security.query_template_error`; enforced by the registry, the CLI, and `PostgresChecker` at run time). Name format: `[a-zA-Z_][a-zA-Z0-9_]*`. Unknown `{{vars}}` left as-is (no error). `SchemaRegistry.resolve_template(template)` is a concrete base-class method — no need to override in new backends.
 - `--create-checker` on snapshot commands: after a successful snapshot, auto-builds and registers a checker from the same connection args. `_extract_env_vars(*templates)` in `cli.py` scans URL/DSN/header values for `$VAR_NAME` patterns (regex `\$([A-Z_][A-Z0-9_]*)`) and populates `env` automatically — no `--env` flag needed. Stores the raw (pre-`{{var}}`-resolution) URL/DSN so the checker can resolve at run time. Checker registration failure is non-fatal (prints warning, exits 0).
 - PostgreSQL query mode nullability contract: columns with zero NULL values across a `LIMIT sample_size` sample are marked `NOT NULL`; any NULL or empty result → nullable (conservative).
 - `SchemaReader.get_schema()` takes no arguments — the target is fixed in the constructor
 - `run_tests.py` contains ~25 basic tests (SQLite introspection, schema comparison, STRUCT drift); domain-specific tests live in `tests/` (`registry_tests.py`, `parsers_tests.py`, `rest_tests.py`, `postgresql_tests.py`, `vars_tests.py`); all files use a custom minimal test runner (no pytest)
 - **Name validation**: every registry entry point that builds a file path validates names with `security.validate_name` (`[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}`, no `..`) and `_safe_path` checks the resolved path stays under `_root`. Template var names use `validate_var_name`. New backends should call these too.
-- **MCP security model**: MCP tool inputs are LLM-controlled and therefore untrusted (the LLM reads third-party data such as remote API field names). Write tools are opt-in (`--allow-writes`). MCP `register_checker` enforces: env vars must be `SHELFARD_*` or in `SHELFARD_MCP_ENV_ALLOWLIST`; every `$VAR` referenced must be declared in `env`; URL must be http(s) and resolve to public IPs unless `SHELFARD_MCP_ALLOW_PRIVATE_HOSTS=1`; existing checkers cannot be overwritten. MCP `set_template_var`/`delete_template_var` refuse vars referenced by any registered checker. CLI-registered checkers are trusted and not subject to these MCP-only checks.
+- **MCP security model**: MCP tool inputs are LLM-controlled and therefore untrusted (the LLM reads third-party data such as remote API field names). Write tools are opt-in (`--allow-writes`). MCP `register_checker` enforces: env vars must be `SHELFARD_*` or in `SHELFARD_MCP_ENV_ALLOWLIST`; every `$VAR` referenced must be declared in `env`; URL must be http(s) and resolve to public IPs unless `SHELFARD_MCP_ALLOW_PRIVATE_HOSTS=1`; existing checkers cannot be overwritten. MCP `register_postgres_checker`: same env rules, table mode only, SQL-identifier table/schema, single public host (no multi-host/Unix socket). MCP-registered checkers are stored with `registered_via="mcp"` and guarded **at run time** too: `RestChecker` passes `guard_private_hosts=True` (socket peer check on every connection/redirect hop → defeats DNS rebinding); `PostgresChecker` re-validates the host and pins the DSN with `hostaddr=<ip>`. MCP `set_template_var`/`delete_template_var` refuse vars referenced by any registered checker. CLI-registered checkers (`registered_via="cli"`, the default) are trusted and not subject to these MCP-only checks. All REST fetches use `net.fetch` (cross-origin redirects drop caller headers).
+- Timestamps use `datetime.now(timezone.utc).isoformat()` (aware, `+00:00` suffix); older registry entries may have naive timestamps — treat them as opaque strings, don't compare across the two formats.
+- Open problems and planned work are tracked in `KNOWN_ISSUES.md`.
 - Registry test isolation: patch `registry._default._root = Path(tmp)` inside a `tempfile.TemporaryDirectory()` block
 - CLI uses argparse with `dest="command"` at the top level; all commands dispatch via `args.func(args)`; `_print_schema(schema_dict, indent)` recurses into STRUCT fields

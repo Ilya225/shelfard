@@ -220,6 +220,7 @@ class RestCheckerConfig:
     env: list[str]                  # e.g. ["BEARER_TOKEN"] — names only, never values
     checker_type: str = "rest"
     registered_at: Optional[str] = None
+    registered_via: str = "cli"     # "cli" (trusted) or "mcp" (LLM-registered, guarded at run time)
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -236,6 +237,7 @@ class RestCheckerConfig:
             env=d.get("env", []),
             checker_type=d.get("checker_type", "rest"),
             registered_at=d.get("registered_at"),
+            registered_via=d.get("registered_via", "cli"),
         )
 
 
@@ -260,6 +262,7 @@ class PostgresCheckerConfig:
     sample_size: int = 100          # rows to sample for nullability inference
     checker_type: str = "postgres"
     registered_at: Optional[str] = None
+    registered_via: str = "cli"     # "cli" (trusted) or "mcp" (LLM-registered, guarded at run time)
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -279,6 +282,7 @@ class PostgresCheckerConfig:
             sample_size=d.get("sample_size", 100),
             checker_type=d.get("checker_type", "postgres"),
             registered_at=d.get("registered_at"),
+            registered_via=d.get("registered_via", "cli"),
         )
 
 

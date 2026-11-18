@@ -6,7 +6,7 @@ Introspects SQLite database files using PRAGMA table_info().
 
 import sqlite3
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 
 from ..base import SchemaReader
 from ...models import ColumnSchema, ColumnType, TableSchema, ToolResult
@@ -106,7 +106,7 @@ class SQLiteReader(SchemaReader):
                 table_name=table_name,
                 columns=columns,
                 source="sqlite",
-                captured_at=datetime.utcnow().isoformat(),
+                captured_at=datetime.now(timezone.utc).isoformat(),
             )
 
             return ToolResult(

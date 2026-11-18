@@ -186,6 +186,8 @@ shelfard postgres check \
 
 Nullability is inferred from sampled data: columns with zero NULL values across the first 100 rows are treated as NOT NULL by contract.
 
+> **Note:** `{{template_vars}}` are not allowed inside `--query` (a stored variable could inject SQL). Write queries literally; use `{{var}}` in the DSN only.
+
 ### Credentials via environment variables
 
 Put secrets in env vars rather than the connection string directly:
@@ -453,13 +455,15 @@ shelfard agent
 
 ```bash
 # Provider shorthand — uses the default model for that provider
-shelfard agent --model anthropic      # claude-sonnet-4-6
-shelfard agent --model openai         # gpt-4o
+shelfard agent --model anthropic      # claude-sonnet-5-5
+shelfard agent --model openai         # gpt-5
 
 # Specific model ID
-shelfard agent --model claude-opus-4-6
-shelfard agent --model gpt-4o-mini
+shelfard agent --model claude-opus-5-5
+shelfard agent --model gpt-5-mini
 ```
+
+Set `SHELFARD_DEFAULT_MODEL` (same syntax as `--model`, e.g. `ollama:qwen2.5:7b`) to choose a default without passing the flag every time. `--model` still wins.
 
 The `--model` flag requires the corresponding API key to be set (`ANTHROPIC_API_KEY` for Claude models, `OPENAI_API_KEY` for OpenAI models).
 
@@ -492,12 +496,26 @@ The agent starts in **read-only** mode: it can inspect schemas, subscriptions, c
 shelfard agent --allow-writes
 ```
 
-Even in write mode, see [MCP security](#security) for the guards that apply. The agent's MCP subprocess only receives `SHELFARD_*` env vars and names listed in `SHELFARD_MCP_ENV_ALLOWLIST` — your LLM API keys are never passed to it.
+In write mode, **every write tool call stops for your approval** before it runs:
+
+```
+⚠  The agent wants to run a write tool: set_template_var
+     name: api_host
+     value: https://api.example.com
+   Allow this action? [y/N]
+```
+
+Anything other than `y` rejects the call and tells the model not to retry. The [MCP security](#security) guards apply as well.
+
+**Environment passed to the tools.** The agent's MCP subprocess receives `SHELFARD_*` env vars, names listed in `SHELFARD_MCP_ENV_ALLOWLIST`, and the env vars declared by checkers **you registered from the CLI** (so `live_check_schema` works for a checker using `$BEARER_TOKEN`). LLM API keys (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, …) are never passed to it.
+
+**Long sessions.** Older turns are summarized automatically once the conversation grows large (scaled to `OLLAMA_NUM_CTX` for local models), keeping the most recent messages verbatim. Type `/reset` to start a fresh conversation.
 
 ### Example session
 
 ```
-Shelfard Agent  [anthropic: claude-sonnet-4-6]  [read-only]  (type 'exit' to quit)
+Shelfard Agent  [anthropic: claude-sonnet-5-5]  [read-only]
+Type 'exit' to quit, '/reset' to start a new conversation.
 
 You: what schemas do I have?
 Agent: You have 2 schemas stored:
@@ -514,7 +532,7 @@ Agent: The posts schema has 4 columns:
 You: exit
 ```
 
-The agent has access to the Shelfard MCP read tools — `get_schemas`, `get_schema` (includes checker info), `get_subscriptions`, `get_subscription`, `get_checker_config`, `live_check_schema`, `get_template_var`, `list_template_vars` — plus, with `--allow-writes`, `register_checker`, `set_template_var`, and `delete_template_var`.
+The agent has access to the Shelfard MCP read tools — `get_schemas`, `get_schema` (includes checker info), `get_subscriptions`, `get_subscription`, `get_checker_config`, `live_check_schema`, `get_template_var`, `list_template_vars` — plus, with `--allow-writes`, `register_checker`, `register_postgres_checker`, `set_template_var`, and `delete_template_var`.
 
 ---
 
@@ -529,7 +547,7 @@ shelfard mcp                  # read-only tools (default)
 shelfard mcp --allow-writes   # also expose write tools (or SHELFARD_MCP_ALLOW_WRITES=1)
 ```
 
-The server runs over **stdio** (the MCP standard for local tools). It exposes eight read tools, plus three write tools (marked ✎) when started with `--allow-writes`:
+The server runs over **stdio** (the MCP standard for local tools). It exposes eight read tools, plus four write tools (marked ✎) when started with `--allow-writes`:
 
 | Tool | Description |
 |---|---|
@@ -538,6 +556,7 @@ The server runs over **stdio** (the MCP standard for local tools). It exposes ei
 | `get_subscriptions` | List all consumer subscriptions |
 | `get_subscription(consumer_name, table_name)` | Retrieve a specific consumer subscription |
 | ✎ `register_checker(schema_name, url, env, headers)` | Register a **new** REST checker config for a schema (see [Security](#security)) |
+| ✎ `register_postgres_checker(schema_name, dsn, table, db_schema, env)` | Register a **new** PostgreSQL checker (table mode only — no custom SQL) |
 | `get_checker_config(schema_name)` | Retrieve the stored checker config (url, env vars, headers) |
 | `live_check_schema(schema_name)` | Run the registered checker against the live endpoint and return the drift result |
 | ✎ `set_template_var(name, value)` | Store a named template variable for use as `{{name}}` in checker configs and snapshot commands |
@@ -570,13 +589,18 @@ Point your MCP client at `shelfard mcp` with stdio transport. The server reads f
 
 MCP tool inputs come from an LLM, and the LLM reads data that third parties control (field names returned by a REST API, for example). A prompt injection could otherwise trick it into sending your secrets to an attacker's URL, or writing files outside the registry. The server therefore treats every tool input as untrusted:
 
-- **Write tools are off by default.** `register_checker`, `set_template_var`, and `delete_template_var` are only exposed with `--allow-writes`.
-- **Env-var allowlist.** Checkers registered via MCP may only reference env vars prefixed with `SHELFARD_` or listed in `SHELFARD_MCP_ENV_ALLOWLIST` (comma-separated). `$ANTHROPIC_API_KEY`, `$AWS_SECRET_ACCESS_KEY`, etc. are rejected. Every `$VAR` in the URL/headers must be declared in `env`.
-- **SSRF guard.** Checkers registered via MCP must use `http(s)` and resolve to public addresses — loopback, private, link-local (e.g. `169.254.169.254` cloud metadata), and reserved ranges are rejected. Set `SHELFARD_MCP_ALLOW_PRIVATE_HOSTS=1` for local development.
+- **Write tools are off by default.** `register_checker`, `register_postgres_checker`, `set_template_var`, and `delete_template_var` are only exposed with `--allow-writes`. In `shelfard agent`, each write call also needs your interactive approval.
+- **Env-var allowlist.** Checkers registered via MCP may only reference env vars prefixed with `SHELFARD_` or listed in `SHELFARD_MCP_ENV_ALLOWLIST` (comma-separated). `$ANTHROPIC_API_KEY`, `$AWS_SECRET_ACCESS_KEY`, etc. are rejected. Every `$VAR` in the URL/headers/DSN must be declared in `env`.
+- **Internal-address (SSRF) guard.** Checkers registered via MCP must target public hosts — loopback, private, link-local (e.g. `169.254.169.254` cloud metadata), and reserved ranges are rejected. This is checked at registration **and again every time the checker runs**:
+  - REST: the address of every TCP connection is verified on the connected socket, including each redirect hop, so DNS rebinding (a name that resolves somewhere else later) is caught.
+  - PostgreSQL: the host is re-resolved and validated, and the connection is pinned to that IP via libpq `hostaddr`. Multi-host and Unix-socket DSNs are rejected. Only table mode is allowed (no custom SQL).
+  - Set `SHELFARD_MCP_ALLOW_PRIVATE_HOSTS=1` for local development.
 - **No tampering with existing checkers.** MCP cannot overwrite an existing checker, and cannot change or delete a template variable that a registered checker references.
 - **Path-traversal guard.** Schema, table, consumer, and checker names must match `[A-Za-z0-9_][A-Za-z0-9_.-]*` (no `/`, no `..`) — enforced in the registry for every entry point, CLI included.
 
-Checkers you register yourself with the CLI are trusted and not subject to the MCP allowlist or host restrictions.
+Checkers you register yourself with the CLI are trusted and not subject to the MCP allowlist or host restrictions. Checkers store how they were registered (`registered_via: "cli" | "mcp"`).
+
+**Applies to every REST fetch** (CLI or MCP): redirects are followed manually (max 5). On a redirect to a different origin, all custom headers are dropped, so secrets in headers like `X-API-Key` never reach another host. Redirects to non-HTTP(S) URLs are refused.
 
 ---
 

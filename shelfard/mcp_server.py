@@ -21,12 +21,16 @@ Security model
 Tool inputs come from an LLM, and the LLM reads untrusted data (e.g. field names
 returned by remote APIs), so every tool input is treated as attacker-controlled:
 
-* Write tools (``register_checker``, ``set_template_var``, ``delete_template_var``)
-  are only exposed with ``--allow-writes`` (or ``SHELFARD_MCP_ALLOW_WRITES=1``).
+* Write tools (``register_checker``, ``register_postgres_checker``,
+  ``set_template_var``, ``delete_template_var``) are only exposed with
+  ``--allow-writes`` (or ``SHELFARD_MCP_ALLOW_WRITES=1``).
 * Checkers registered through MCP may only reference env vars prefixed with
   ``SHELFARD_`` or listed in ``SHELFARD_MCP_ENV_ALLOWLIST``, may only target public
-  http(s) hosts (unless ``SHELFARD_MCP_ALLOW_PRIVATE_HOSTS=1``), and may not
-  overwrite an existing checker.
+  hosts (unless ``SHELFARD_MCP_ALLOW_PRIVATE_HOSTS=1``), and may not overwrite an
+  existing checker. They are stored with ``registered_via="mcp"`` and re-checked when
+  they run: REST connections are verified on the connected socket (incl. redirects) and
+  PostgreSQL connections are pinned to a validated IP (DNS-rebinding guard).
+* PostgreSQL checkers registered through MCP are table-mode only (no custom SQL).
 * Template variables referenced by an existing checker cannot be changed through
   MCP, so a stored checker (and its credentials) cannot be redirected.
 * All names used in file paths are validated by the registry (path-traversal guard).
@@ -57,11 +61,15 @@ from .registry import (
     delete_var as _delete_var,
 )
 from .models import ToolResult
-from .security import check_env_allowed, check_url_safe, extract_env_refs, validate_name
+from .security import (
+    check_env_allowed, check_pg_dsn_safe, check_url_safe, extract_env_refs,
+    private_hosts_allowed, validate_name,
+)
 
 ALLOW_WRITES_ENV = "SHELFARD_MCP_ALLOW_WRITES"
 
 _TEMPLATE_REF = re.compile(r"\{\{([a-zA-Z_][a-zA-Z0-9_]*)\}\}")
+_SQL_IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_$]{0,62}$")
 
 
 def _error(message: str) -> str:
@@ -154,8 +162,8 @@ def register_checker(
         header_list = _json.loads(headers)
     except _json.JSONDecodeError as e:
         return _error(f"env and headers must be JSON arrays: {e}")
-    if not (isinstance(env_list, list) and all(isinstance(n, str) for n in env_list)):
-        return _error("env must be a JSON array of strings.")
+    if err := _check_env_list(env_list):
+        return _error(err)
     if not (
         isinstance(header_list, list)
         and all(
@@ -165,19 +173,12 @@ def register_checker(
     ):
         return _error("headers must be a JSON array of {name: value} string objects.")
 
-    if get_checker(schema_name).success:
-        return _error(
-            f"A checker for '{schema_name}' already exists. Checkers cannot be overwritten "
-            f"through MCP; change it with 'shelfard checker register' instead."
-        )
+    if err := _check_not_registered(schema_name):
+        return _error(err)
 
     header_values = [v for h in header_list for v in h.values()]
-    referenced = extract_env_refs(url, *header_values)
-    if err := check_env_allowed(sorted(set(env_list) | referenced)):
+    if err := _check_env_refs(env_list, url, *header_values):
         return _error(err)
-    undeclared = sorted(referenced - set(env_list))
-    if undeclared:
-        return _error(f"$VAR references not declared in env: {', '.join(undeclared)}")
 
     if err := check_url_safe(_resolve_template(url)):
         return _error(err)
@@ -187,8 +188,84 @@ def register_checker(
         url=url,
         headers=header_list,
         env=env_list,
+        registered_via="mcp",
     )
     return _register_checker(schema_name, config).to_json()
+
+
+def register_postgres_checker(
+    schema_name: str,
+    dsn: str,
+    table: str,
+    db_schema: str = "public",
+    env: str = "[]",
+) -> str:
+    """Register a new PostgreSQL checker (table mode) for a schema; cannot overwrite one.
+    dsn: e.g. 'postgresql://reader:$SHELFARD_PG_PASSWORD@db.example.com:5432/app'. The host
+         must be literal or a {{template_var}} and resolve to a public address; $VAR may be
+         used for credentials only.
+    table: table or view to introspect. Custom SQL queries are not allowed through MCP.
+    env: JSON array of env var names, e.g. '["SHELFARD_PG_PASSWORD"]'. Only names prefixed
+         with SHELFARD_ (or listed in SHELFARD_MCP_ENV_ALLOWLIST) are allowed."""
+    from .models import PostgresCheckerConfig
+
+    if err := validate_name(schema_name, "schema name"):
+        return _error(err)
+    if not _SQL_IDENT.fullmatch(table or ""):
+        return _error(f"Invalid table name {table!r}: must be a plain SQL identifier.")
+    if not _SQL_IDENT.fullmatch(db_schema or ""):
+        return _error(f"Invalid db_schema {db_schema!r}: must be a plain SQL identifier.")
+    try:
+        env_list = _json.loads(env)
+    except _json.JSONDecodeError as e:
+        return _error(f"env must be a JSON array: {e}")
+    if err := _check_env_list(env_list):
+        return _error(err)
+    if err := _check_not_registered(schema_name):
+        return _error(err)
+    if err := _check_env_refs(env_list, dsn):
+        return _error(err)
+
+    if not private_hosts_allowed():
+        err, _ = check_pg_dsn_safe(_resolve_template(dsn))
+        if err:
+            return _error(err)
+
+    config = PostgresCheckerConfig(
+        schema_name=schema_name,
+        dsn=dsn,
+        env=env_list,
+        table=table,
+        db_schema=db_schema,
+        registered_via="mcp",
+    )
+    return _register_checker(schema_name, config).to_json()
+
+
+def _check_env_list(env_list) -> str | None:
+    if not (isinstance(env_list, list) and all(isinstance(n, str) for n in env_list)):
+        return "env must be a JSON array of strings."
+    return None
+
+
+def _check_not_registered(schema_name: str) -> str | None:
+    if get_checker(schema_name).success:
+        return (
+            f"A checker for '{schema_name}' already exists. Checkers cannot be overwritten "
+            f"through MCP; change it with 'shelfard checker register' instead."
+        )
+    return None
+
+
+def _check_env_refs(env_list: list[str], *templates: str) -> str | None:
+    """Env vars must be allowlisted and every $VAR referenced must be declared in env."""
+    referenced = extract_env_refs(*templates)
+    if err := check_env_allowed(sorted(set(env_list) | referenced)):
+        return err
+    undeclared = sorted(referenced - set(env_list))
+    if undeclared:
+        return f"$VAR references not declared in env: {', '.join(undeclared)}"
+    return None
 
 
 def set_template_var(name: str, value: str) -> str:
@@ -218,7 +295,7 @@ READ_TOOLS = (
     get_schema, get_schemas, get_subscriptions, get_subscription,
     get_checker_config, live_check_schema, get_template_var, list_template_vars,
 )
-WRITE_TOOLS = (register_checker, set_template_var, delete_template_var)
+WRITE_TOOLS = (register_checker, register_postgres_checker, set_template_var, delete_template_var)
 
 
 def build_server(allow_writes: bool = False) -> FastMCP:

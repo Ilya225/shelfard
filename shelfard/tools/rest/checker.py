@@ -5,6 +5,7 @@ import os
 from ...models import RestCheckerConfig, ToolResult
 from .reader import RestEndpointReader
 from ...schema_comparison import compare_schemas_from_dicts
+from ...security import private_hosts_allowed
 from ..base import Checker
 
 
@@ -20,6 +21,11 @@ class RestChecker(Checker):
             return ToolResult(
                 success=False,
                 error=f"Missing required env vars: {', '.join(missing)}",
+                next_action_hint=(
+                    "Export them before running. Inside 'shelfard agent', the agent forwards "
+                    "env vars declared by checkers registered from the CLI; LLM API keys are "
+                    "never forwarded."
+                ),
             )
 
         # 1.5 — Resolve {{template_vars}} from registry (before $ENV_VAR substitution)
@@ -36,9 +42,13 @@ class RestChecker(Checker):
             for k, v in entry.items():
                 resolved_headers[k] = _substitute(v, self.config.env)
 
-        # 3. Fetch current schema from the live endpoint
+        # 3. Fetch current schema from the live endpoint. Checkers registered through MCP
+        #    are LLM-controlled: guard every connection (incl. redirects) against internal
+        #    addresses on the connected socket, which also defeats DNS rebinding.
+        guard = self.config.registered_via == "mcp" and not private_hosts_allowed()
         new_result = RestEndpointReader(
-            url, self.config.schema_name, headers=resolved_headers or None
+            url, self.config.schema_name, headers=resolved_headers or None,
+            guard_private_hosts=guard,
         ).get_schema()
         if not new_result.success:
             return ToolResult(success=False, error=f"Fetch failed: {new_result.error}")

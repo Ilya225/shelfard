@@ -11,6 +11,9 @@ import os
 
 from ..base import Checker
 from ...models import PostgresCheckerConfig, ToolResult
+from ...security import (
+    check_pg_dsn_safe, pin_pg_dsn, private_hosts_allowed, query_template_error,
+)
 
 
 class PostgresChecker(Checker):
@@ -27,15 +30,20 @@ class PostgresChecker(Checker):
             return ToolResult(
                 success=False,
                 error=f"Missing required environment variables: {', '.join(missing)}",
-                next_action_hint=f"Export the missing variables before running: {', '.join(missing)}",
+                next_action_hint=(
+                    "Export them before running. Inside 'shelfard agent', the agent forwards "
+                    "env vars declared by checkers registered from the CLI; LLM API keys are "
+                    "never forwarded."
+                ),
             )
 
-        # 1.5 — Resolve {{template_vars}} from registry (before $ENV_VAR substitution)
+        # 1.2 — SQL queries must not contain {{template_vars}} (SQL-injection guard)
+        if err := query_template_error(self.config.query):
+            return ToolResult(success=False, error=err)
+
+        # 1.5 — Resolve {{template_vars}} in the DSN (before $ENV_VAR substitution)
         dsn_template = self.registry.resolve_template(self.config.dsn)
-        query_template = (
-            self.registry.resolve_template(self.config.query)
-            if self.config.query else None
-        )
+        query_template = self.config.query
 
         # 2. Resolve $VAR placeholders in DSN and query (if any)
         resolved_dsn = _substitute(dsn_template, self.config.env)
@@ -44,6 +52,16 @@ class PostgresChecker(Checker):
             if query_template
             else None
         )
+
+        # 2.5 — Checkers registered through MCP: the resolved DSN must target exactly one
+        #       public host; pin the connection to the validated IP via hostaddr so libpq
+        #       cannot resolve the name again (DNS-rebinding guard).
+        if self.config.registered_via == "mcp" and not private_hosts_allowed():
+            err, pinned_ip = check_pg_dsn_safe(resolved_dsn)
+            if err:
+                return ToolResult(success=False, error=f"Blocked unsafe DSN: {err}")
+            if pinned_ip:
+                resolved_dsn = pin_pg_dsn(resolved_dsn, pinned_ip)
 
         # 3. Fetch live schema
         from .reader import PostgresReader

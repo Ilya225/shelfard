@@ -8,13 +8,14 @@ over time.
 infer_schema_from_openapi() is planned but not yet implemented.
 """
 
-from datetime import datetime
+from datetime import datetime, timezone
 
 import requests
 
 from ..base import SchemaReader
 from ...models import TableSchema, ToolResult
 from ...parsers.json_file_reader import _build_column_schema
+from ...net import UnsafeRedirectError, fetch
 
 
 class RestEndpointReader(SchemaReader):
@@ -33,6 +34,7 @@ class RestEndpointReader(SchemaReader):
         *,
         bearer_token: str | None = None,
         headers: dict | None = None,
+        guard_private_hosts: bool = False,
     ):
         """
         Args:
@@ -40,9 +42,12 @@ class RestEndpointReader(SchemaReader):
             schema_name:  Logical name for the schema (used as table_name in TableSchema).
             bearer_token: Convenience param — sets Authorization: Bearer <token>.
             headers:      Arbitrary extra headers; merged last so they override bearer_token.
+            guard_private_hosts: Refuse connections (including redirect hops) to private,
+                          loopback, or link-local addresses, checked on the connected socket.
         """
         self.url = url
         self.schema_name = schema_name
+        self._guard_private_hosts = guard_private_hosts
         self._headers: dict[str, str] = {}
         if bearer_token:
             self._headers["Authorization"] = f"Bearer {bearer_token}"
@@ -57,7 +62,9 @@ class RestEndpointReader(SchemaReader):
         Nested dicts are inferred as STRUCT columns recursively.
         """
         try:
-            response = requests.get(self.url, headers=self._headers, timeout=30)
+            response = fetch(
+                self.url, self._headers, guard_private=self._guard_private_hosts, timeout=30,
+            )
             response.raise_for_status()
         except requests.exceptions.HTTPError as e:
             return ToolResult(
@@ -77,6 +84,10 @@ class RestEndpointReader(SchemaReader):
                 error="Request timed out after 30 seconds.",
                 next_action_hint="Check if the endpoint is responsive.",
             )
+        except (requests.exceptions.TooManyRedirects, UnsafeRedirectError) as e:
+            return ToolResult(success=False, error=f"Redirect refused: {e}")
+        except requests.exceptions.RequestException as e:
+            return ToolResult(success=False, error=f"Request failed: {e}")
 
         try:
             data = response.json()
@@ -107,7 +118,7 @@ class RestEndpointReader(SchemaReader):
             table_name=self.schema_name,
             columns=columns,
             source="rest_api",
-            captured_at=datetime.utcnow().isoformat(),
+            captured_at=datetime.now(timezone.utc).isoformat(),
         )
 
         return ToolResult(

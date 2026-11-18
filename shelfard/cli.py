@@ -25,6 +25,7 @@ from shelfard import (
 )
 from shelfard.models import ChangeSeverity
 from shelfard.registry import _default as _registry
+from shelfard.security import query_template_error
 
 
 # ── ANSI colours ──────────────────────────────────────────────────────────────
@@ -226,10 +227,20 @@ def cmd_rest_check(args) -> int:
 
 # ── PostgreSQL commands ───────────────────────────────────────────────────────
 
+def _query_template_rejected(query) -> bool:
+    """Print an error and return True if a --query contains {{var}} templates."""
+    err = query_template_error(query)
+    if err:
+        print(red(f"✗ {err}"))
+    return bool(err)
+
+
 def cmd_postgres_snapshot(args) -> int:
     schema_name = args.name
+    if _query_template_rejected(args.query):
+        return 2
     dsn = _resolve_template_vars(args.dsn)
-    query = _resolve_template_vars(args.query) if args.query else None
+    query = args.query or None
     target = args.table or "(custom query)"
     print(f"Reading PostgreSQL '{target}' …")
 
@@ -280,8 +291,10 @@ def cmd_postgres_snapshot(args) -> int:
 
 def cmd_postgres_check(args) -> int:
     schema_name = args.name
+    if _query_template_rejected(args.query):
+        return 2
     dsn = _resolve_template_vars(args.dsn)
-    query = _resolve_template_vars(args.query) if args.query else None
+    query = args.query or None
     target = args.table or "(custom query)"
     print(f"Reading PostgreSQL '{target}' …")
 
@@ -452,6 +465,8 @@ def cmd_checker_register(args) -> int:
             return 2
         if args.table and args.query:
             print(red("✗ Provide either --table or --query, not both"))
+            return 2
+        if _query_template_rejected(args.query):
             return 2
         config = PostgresCheckerConfig(
             schema_name=args.schema_name,

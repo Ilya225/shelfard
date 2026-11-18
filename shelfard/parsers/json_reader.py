@@ -8,7 +8,7 @@ This is a document deserializer, not a live source introspector,
 so it does not implement the SchemaReader ABC.
 """
 
-from datetime import datetime
+from datetime import datetime, timezone
 
 from ..models import ColumnSchema, TableSchema, ToolResult, ColumnType
 
@@ -40,7 +40,7 @@ def get_schema_from_json(schema_dict: dict) -> ToolResult:
             partition_keys=schema_dict.get("partition_keys", []),
             clustering_keys=schema_dict.get("clustering_keys", []),
             source=schema_dict.get("source", "json_payload"),
-            captured_at=datetime.utcnow().isoformat(),
+            captured_at=datetime.now(timezone.utc).isoformat(),
         )
 
         return ToolResult(

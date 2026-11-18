@@ -16,16 +16,43 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install package and dependencies
-        run: pip install -e .
+      - name: Install package and dependencies (incl. optional extras)
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[ollama,postgres]"
 
       - name: Lint (syntax errors and undefined names)
         run: |
           pip install flake8
           flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
 
-      - name: Run unit tests
-        run: python run_tests.py
+      - name: Run all test suites
+        run: |
+          set -e
+          python run_tests.py
+          for f in tests/*_tests.py; do
+            echo "::group::$f"
+            python "$f"
+            echo "::endgroup::"
+          done
 
-      - name: Run REST integration tests
-        run: python tests/test_rest_reader.py
+  audit:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install package and dependencies (incl. optional extras)
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[ollama,postgres]"
+
+      - name: Audit dependencies for known vulnerabilities
+        run: |
+          pip install pip-audit
+          pip-audit --skip-editable --progress-spinner off

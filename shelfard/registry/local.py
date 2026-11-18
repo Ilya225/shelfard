@@ -15,7 +15,7 @@ Each JSON file stores: {"table_name": "...", "versions": [...]}
 from __future__ import annotations
 
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -24,7 +24,7 @@ from ..models import (
     RestCheckerConfig, PostgresCheckerConfig,
 )
 from .base import SchemaRegistry
-from ..security import ensure_within, validate_name, validate_var_name
+from ..security import ensure_within, query_template_error, validate_name, validate_var_name
 
 
 class LocalFileRegistry(SchemaRegistry):
@@ -94,7 +94,7 @@ class LocalFileRegistry(SchemaRegistry):
             else:
                 registry_data = {"table_name": table_name, "versions": []}
 
-            schema.captured_at = datetime.utcnow().isoformat()
+            schema.captured_at = datetime.now(timezone.utc).isoformat()
             registry_data["versions"].append(schema.to_dict())
             self._save_json(path, registry_data)
 
@@ -239,7 +239,7 @@ class LocalFileRegistry(SchemaRegistry):
             source_table=table_name,
             subscribed_columns=columns,
             schema=snapshot,
-            subscribed_at=datetime.utcnow().isoformat(),
+            subscribed_at=datetime.now(timezone.utc).isoformat(),
             source_schema_version=source_version,
         )
 
@@ -375,7 +375,9 @@ class LocalFileRegistry(SchemaRegistry):
                 success=False,
                 error=f"Config schema_name {config.schema_name!r} does not match {schema_name!r}.",
             )
-        config.registered_at = datetime.utcnow().isoformat()
+        if err := query_template_error(getattr(config, "query", None)):
+            return ToolResult(success=False, error=err)
+        config.registered_at = datetime.now(timezone.utc).isoformat()
         path = self._checker_path(schema_name)
         try:
             self._save_json(path, config.to_dict())
@@ -418,6 +420,7 @@ class LocalFileRegistry(SchemaRegistry):
                     "dsn": c.get("dsn", ""),       # postgres checkers
                     "env": c.get("env", []),
                     "registered_at": c.get("registered_at"),
+                    "registered_via": c.get("registered_via", "cli"),
                 })
             except Exception:
                 pass
