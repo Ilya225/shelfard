@@ -319,7 +319,7 @@ def test_mcp_accept(tmp):
         base = registry.get_registered_schema("orders").data["version"]
         d = registry.compare_with_baseline("orders", V1.to_dict(), V2.to_dict()).data["diff"]
         fake = ToolResult(success=True, data={"diff": d, "baseline_version": base})
-        with mock.patch.object(mcp_server, "_run_probe", return_value=fake):
+        with mock.patch.object(registry._default, "run_probe", return_value=fake):
             out = json.loads(mcp_server.accept_schema_update("orders"))
             assert not out["success"] and "allow_unaffected" in out["error"], out
             out = json.loads(mcp_server.accept_schema_update("orders", allow_unaffected=True))

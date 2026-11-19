@@ -272,6 +272,20 @@ class ColumnChange:
     def to_dict(self) -> dict:
         return asdict(self)
 
+    @classmethod
+    def from_dict(cls, d: dict) -> "ColumnChange":
+        impact = d.get("consumer_impact")
+        return cls(
+            change_type=ChangeType(d["change_type"]),
+            column_name=d["column_name"],
+            old_value=d.get("old_value"),
+            new_value=d.get("new_value"),
+            severity=ChangeSeverity(d.get("severity", ChangeSeverity.SAFE)),
+            reasoning=d.get("reasoning", ""),
+            consumer_impact=ConsumerImpact(impact) if impact is not None else None,
+            consumers=list(d.get("consumers") or []),
+        )
+
 
 @dataclass
 class SchemaDiff:
@@ -305,6 +319,20 @@ class SchemaDiff:
 
     def to_json(self) -> str:
         return json.dumps(self.to_dict(), indent=2, default=str)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "SchemaDiff":
+        """Inverse of to_dict (also accepts the JSON form, enums as strings)."""
+        return cls(
+            table_name=d["table_name"],
+            old_schema_version=d.get("old_schema_version"),
+            new_schema_version=d.get("new_schema_version"),
+            changes=[ColumnChange.from_dict(c) for c in d.get("changes") or []],
+            overall_severity=ChangeSeverity(d.get("overall_severity", ChangeSeverity.SAFE)),
+            summary=d.get("summary", ""),
+            suggested_update=d.get("suggested_update"),
+            consumer_summary=d.get("consumer_summary"),
+        )
 
 
 # ─────────────────────────────────────────────
@@ -452,6 +480,25 @@ class IcebergProbeConfig:
             registered_at=d.get("registered_at"),
             registered_via=d.get("registered_via", "cli"),
         )
+
+
+ProbeConfig = RestProbeConfig | PostgresProbeConfig | FileProbeConfig | IcebergProbeConfig
+
+_PROBE_CONFIGS = {
+    "rest": RestProbeConfig,
+    "postgres": PostgresProbeConfig,
+    "file": FileProbeConfig,
+    "iceberg": IcebergProbeConfig,
+}
+
+
+def probe_config_from_dict(d: dict) -> ProbeConfig:
+    """Rebuild the right probe config class from a stored dict (by ``probe_type``)."""
+    probe_type = d.get("probe_type", "rest")
+    cls = _PROBE_CONFIGS.get(probe_type)
+    if cls is None:
+        raise ValueError(f"Unknown probe type: {probe_type!r}")
+    return cls.from_dict(d)
 
 
 # ─────────────────────────────────────────────

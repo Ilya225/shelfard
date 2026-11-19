@@ -52,7 +52,8 @@ class RestProbe(Probe):
             guard_private_hosts=guard,
         ).get_schema()
         if not new_result.success:
-            return ToolResult(success=False, error=f"Fetch failed: {new_result.error}")
+            return ToolResult(success=False, error=f"Fetch failed: {new_result.error}",
+                              next_action_hint=getattr(new_result, "next_action_hint", None))
         return new_result
 
     def run(self) -> ToolResult:

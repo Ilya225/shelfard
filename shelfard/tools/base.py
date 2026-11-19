@@ -63,3 +63,22 @@ def compare_against_baseline(registry, table_name: str, baseline: dict, live: di
         return registry.compare_with_baseline(table_name, baseline, live)
     from ..schema_comparison import compare_schemas_from_dicts
     return compare_schemas_from_dicts(baseline, live)
+
+
+def probe_for(config, registry) -> Probe:
+    """The Probe implementation for a probe config (registered or ad hoc).
+    Raises ValueError for an unknown ``probe_type``."""
+    probe_type = getattr(config, "probe_type", None)
+    if probe_type == "rest":
+        from .rest import RestProbe
+        return RestProbe(config, registry)
+    if probe_type == "postgres":
+        from .postgres import PostgresProbe
+        return PostgresProbe(config, registry)
+    if probe_type == "file":
+        from .files import FileProbe
+        return FileProbe(config, registry)
+    if probe_type == "iceberg":
+        from .iceberg import IcebergProbe
+        return IcebergProbe(config, registry)
+    raise ValueError(f"Unknown probe type: {probe_type!r}")

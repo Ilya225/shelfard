@@ -438,26 +438,16 @@ class LocalFileRegistry(SchemaRegistry):
 
     def _build_probe(self, schema_name: str):
         """Return (probe, None) for a stored config, or (None, error ToolResult)."""
+        from ..models import probe_config_from_dict
+        from ..tools.base import probe_for
+
         result = self.get_probe(schema_name)
         if not result.success:
             return None, result
-
-        config_dict = result.data["probe"]
-        probe_type = config_dict.get("probe_type", "rest")
-
-        if probe_type == "rest":
-            from ..tools.rest import RestProbe
-            return RestProbe(RestProbeConfig.from_dict(config_dict), self), None
-        if probe_type == "postgres":
-            from ..tools.postgres import PostgresProbe
-            return PostgresProbe(PostgresProbeConfig.from_dict(config_dict), self), None
-        if probe_type == "file":
-            from ..tools.files import FileProbe
-            return FileProbe(FileProbeConfig.from_dict(config_dict), self), None
-        if probe_type == "iceberg":
-            from ..tools.iceberg import IcebergProbe
-            return IcebergProbe(IcebergProbeConfig.from_dict(config_dict), self), None
-        return None, ToolResult(success=False, error=f"Unknown probe type: {probe_type!r}")
+        try:
+            return probe_for(probe_config_from_dict(result.data["probe"]), self), None
+        except ValueError as e:
+            return None, ToolResult(success=False, error=str(e))
 
     def run_probe(self, schema_name: str) -> ToolResult:
         """Load the probe config and run the live drift check."""

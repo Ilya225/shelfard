@@ -37,7 +37,8 @@ class IcebergProbe(Probe):
 
         live = IcebergReader(path, self.config.schema_name).get_schema()
         if not live.success:
-            return ToolResult(success=False, error=f"Failed to read live schema: {live.error}")
+            return ToolResult(success=False, error=f"Failed to read live schema: {live.error}",
+                              next_action_hint=getattr(live, "next_action_hint", None))
         return live
 
     def run(self) -> ToolResult:

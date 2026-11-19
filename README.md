@@ -852,6 +852,34 @@ A projection is stored as one unversioned file at `schemas/consumers/<consumer>/
 
 ---
 
+## Using Shelfard from Python (handlers)
+
+Every CLI command and MCP tool is a thin controller over a transport-agnostic
+handler: build a payload (a `Command` that writes or a `Query` that reads),
+dispatch it, and get a typed `Response` back. A REST/gRPC/UI layer can reuse the
+same handlers.
+
+```python
+from shelfard.handlers import AcceptUpdate, CheckDrift, Dispatcher, ErrorCode, dispatch
+from shelfard import LocalFileRegistry
+
+resp = dispatch(CheckDrift("orders"))            # runs the registered probe; never writes
+if not resp.ok:
+    print(resp.error.code, resp.error.message)   # e.g. ErrorCode.NOT_FOUND
+else:
+    report = resp.result                         # DriftReport with a typed SchemaDiff
+    for change in report.diff.changes:
+        print(change.severity.value, change.column_name, change.consumer_impact)
+    if report.diff.suggested_update:
+        dispatch(AcceptUpdate("orders", report.diff, report.baseline_version))
+
+# Work on another registry instead of ./schemas
+d = Dispatcher(LocalFileRegistry("/path/to/registry"))
+```
+
+Error codes (`not_found`, `invalid`, `conflict`, `refused`, `failed`) are left to
+each controller to map (the CLI exits with 2; an HTTP layer could use 404/400/409/422/500).
+
 ## Pluggable registry backends
 
 The default backend stores schemas as local JSON files. Swap it out by instantiating a different `SchemaRegistry` implementation:

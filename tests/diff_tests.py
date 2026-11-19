@@ -335,7 +335,7 @@ def test_cli_update_flow():
         live = mock.Mock(**{"get_schema.return_value": mock.Mock(
             success=True, data={"schema": rest(infer("name", "Ann")).to_dict()})})
         args = SimpleNamespace(name="orders", url="https://x", header=None, bearer=None, update=False)
-        with mock.patch.object(cli, "RestEndpointReader", return_value=live):
+        with mock.patch("shelfard.tools.rest.probe.RestEndpointReader", return_value=live):
             out = io.StringIO()
             with redirect_stdout(out):
                 code = cli.cmd_rest_check(args)
@@ -364,7 +364,7 @@ def test_cli_update_ignored_for_breaking():
         live = mock.Mock(**{"get_schema.return_value": mock.Mock(
             success=True, data={"schema": rest(infer("other", 1)).to_dict()})})
         args = SimpleNamespace(name="orders", url="https://x", header=None, bearer=None, update=True)
-        with mock.patch.object(cli, "RestEndpointReader", return_value=live):
+        with mock.patch("shelfard.tools.rest.probe.RestEndpointReader", return_value=live):
             out = io.StringIO()
             with redirect_stdout(out):
                 code = cli.cmd_rest_check(args)
@@ -373,7 +373,7 @@ def test_cli_update_ignored_for_breaking():
         assert registry.get_registered_schema("orders").data["version_count"] == 1
         registry.register_schema("orders", rest(infer("name", "Ann")))
         registry.subscribe_consumer("crm", "orders", ["name"])
-        with mock.patch.object(cli, "RestEndpointReader", return_value=live):
+        with mock.patch("shelfard.tools.rest.probe.RestEndpointReader", return_value=live):
             out = io.StringIO()
             with redirect_stdout(out):
                 args.allow_unaffected = True
@@ -394,7 +394,7 @@ def test_mcp_accept_tool():
         base = registry.get_registered_schema("orders").data
         d = diff(TableSchema.from_dict(base["schema"]), rest(infer("name", "Ann")))
         fake = ToolResult(success=True, data={"diff": d, "baseline_version": base["version"]})
-        with mock.patch.object(mcp_server, "_run_probe", return_value=fake):
+        with mock.patch.object(registry._default, "run_probe", return_value=fake):
             out = json.loads(mcp_server.accept_schema_update("orders"))
         assert out["success"] and out["data"]["version_count"] == 2, out
         assert mcp_server.accept_schema_update in mcp_server.WRITE_TOOLS

@@ -81,6 +81,7 @@ class PostgresProbe(Probe):
             return ToolResult(
                 success=False,
                 error=f"Failed to fetch live schema: {live_result.error}",
+                next_action_hint=getattr(live_result, "next_action_hint", None),
             )
         return live_result
 
