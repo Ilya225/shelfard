@@ -181,48 +181,59 @@ class TableSchema:
 
 
 @dataclass
-class ConsumerSubscription:
+class ConsumerProjection:
     """
-    Records that a named consumer depends on (a projection of) a source schema.
+    What a named consumer reads from a source schema — not versioned.
 
-    subscribed_columns=None means the consumer subscribed to the full schema.
-    subscribed_columns=[...] means the consumer only reads those columns (projection).
-    schema holds the TableSchema snapshot at subscription time (projected or full).
+    ``columns`` are paths into the source schema (``id``, ``address.zip``,
+    ``tags[]``, ``tags[].sku``); ``expected`` is the shape the consumer relies on
+    for them (the source schema projected onto those paths when the consumer
+    subscribed or last refreshed). The projection always refers to the source
+    schema by name, i.e. to its latest registered version; drift is judged per
+    consumer by comparing ``expected`` with the newly observed schema.
+
+    Projections belong to their consumers: baseline updates never modify them;
+    the consumer refreshes (re-subscribes) when they want to adopt a new shape.
     """
     consumer_name: str
     source_table: str
-    subscribed_columns: Optional[list[str]]   # None = full subscription
-    schema: TableSchema                        # projected or full snapshot
-    subscribed_at: str                         # ISO timestamp
-    source_schema_version: str                 # captured_at of source at subscription time
+    columns: list[str]
+    expected: list[ColumnSchema]
+    source: str = "unknown"           # source kind of the schema (sampled-source rules apply)
+    full: bool = False                # subscribed without a column list (all top-level columns)
+    subscribed_at: Optional[str] = None
+    updated_at: Optional[str] = None
+
+    def expected_schema(self) -> TableSchema:
+        return TableSchema(table_name=self.source_table, columns=list(self.expected),
+                           source=self.source, captured_at=self.updated_at)
 
     def to_dict(self) -> dict:
         return asdict(self)
 
     @classmethod
-    def from_dict(cls, d: dict) -> ConsumerSubscription:
-        schema_d = d["schema"]
-        schema = TableSchema(
-            table_name=schema_d["table_name"],
-            columns=[ColumnSchema.from_dict(c) for c in schema_d["columns"]],
-            partition_keys=schema_d.get("partition_keys", []),
-            clustering_keys=schema_d.get("clustering_keys", []),
-            source=schema_d.get("source", "registry"),
-            captured_at=schema_d.get("captured_at"),
-        )
+    def from_dict(cls, d: dict) -> "ConsumerProjection":
         return cls(
             consumer_name=d["consumer_name"],
             source_table=d["source_table"],
-            subscribed_columns=d.get("subscribed_columns"),
-            schema=schema,
-            subscribed_at=d["subscribed_at"],
-            source_schema_version=d["source_schema_version"],
+            columns=list(d.get("columns") or []),
+            expected=[ColumnSchema.from_dict(c) for c in d.get("expected") or []],
+            source=d.get("source", "unknown"),
+            full=bool(d.get("full", False)),
+            subscribed_at=d.get("subscribed_at"),
+            updated_at=d.get("updated_at"),
         )
 
 
 # ─────────────────────────────────────────────
 # Diff models
 # ─────────────────────────────────────────────
+
+class ConsumerImpact(str, Enum):
+    """Qualifies a change's severity by who reads the changed column."""
+    NO_CONSUMERS         = "no_consumers"          # no consumer projection is affected
+    CONSUMER_CONSTRAINED = "consumer_constrained"  # at least one consumer reads it
+
 
 class ChangeSeverity(str, Enum):
     SAFE     = "SAFE"      # additive, non-breaking
@@ -254,6 +265,9 @@ class ColumnChange:
     new_value: Optional[dict] = None
     severity: ChangeSeverity = ChangeSeverity.SAFE
     reasoning: str = ""                 # human-readable explanation of severity decision
+    # Filled in by consumer impact analysis (shelfard.projection.annotate):
+    consumer_impact: Optional[ConsumerImpact] = None
+    consumers: list[dict] = field(default_factory=list)   # [{"consumer": ..., "severity": ...}]
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -270,6 +284,9 @@ class SchemaDiff:
     # Present when every change is SAFE: the explanation of each change and the
     # schema to register as the next baseline version (see schema_comparison).
     suggested_update: Optional[dict] = None
+    # Consumer impact: total / affected counts, per-consumer severity, outdated
+    # projections (see shelfard.projection.annotate). None = not analysed.
+    consumer_summary: Optional[dict] = None
 
     @property
     def has_changes(self) -> bool:
@@ -291,17 +308,17 @@ class SchemaDiff:
 
 
 # ─────────────────────────────────────────────
-# Checker config
+# Probe config
 # ─────────────────────────────────────────────
 
 @dataclass
-class RestCheckerConfig:
+class RestProbeConfig:
     """Stored configuration for a REST-based drift check."""
     schema_name: str
     url: str
     headers: list[dict[str, str]]   # e.g. [{"Authorization": "$BEARER_TOKEN"}]
     env: list[str]                  # e.g. ["BEARER_TOKEN"] — names only, never values
-    checker_type: str = "rest"
+    probe_type: str = "rest"
     registered_at: Optional[str] = None
     registered_via: str = "cli"     # "cli" (trusted) or "mcp" (LLM-registered, guarded at run time)
 
@@ -312,20 +329,20 @@ class RestCheckerConfig:
         return json.dumps(self.to_dict(), indent=2, default=str)
 
     @classmethod
-    def from_dict(cls, d: dict) -> "RestCheckerConfig":
+    def from_dict(cls, d: dict) -> "RestProbeConfig":
         return cls(
             schema_name=d["schema_name"],
             url=d["url"],
             headers=d.get("headers", []),
             env=d.get("env", []),
-            checker_type=d.get("checker_type", "rest"),
+            probe_type=d.get("probe_type", "rest"),
             registered_at=d.get("registered_at"),
             registered_via=d.get("registered_via", "cli"),
         )
 
 
 @dataclass
-class PostgresCheckerConfig:
+class PostgresProbeConfig:
     """Stored configuration for a PostgreSQL drift check.
 
     Two modes:
@@ -343,7 +360,7 @@ class PostgresCheckerConfig:
     query: Optional[str] = None     # SQL query        (query mode)
     db_schema: str = "public"       # PostgreSQL schema namespace
     sample_size: int = 100          # rows to sample for nullability inference
-    checker_type: str = "postgres"
+    probe_type: str = "postgres"
     registered_at: Optional[str] = None
     registered_via: str = "cli"     # "cli" (trusted) or "mcp" (LLM-registered, guarded at run time)
 
@@ -354,7 +371,7 @@ class PostgresCheckerConfig:
         return json.dumps(self.to_dict(), indent=2, default=str)
 
     @classmethod
-    def from_dict(cls, d: dict) -> "PostgresCheckerConfig":
+    def from_dict(cls, d: dict) -> "PostgresProbeConfig":
         return cls(
             schema_name=d["schema_name"],
             dsn=d["dsn"],
@@ -363,14 +380,14 @@ class PostgresCheckerConfig:
             query=d.get("query"),
             db_schema=d.get("db_schema", "public"),
             sample_size=d.get("sample_size", 100),
-            checker_type=d.get("checker_type", "postgres"),
+            probe_type=d.get("probe_type", "postgres"),
             registered_at=d.get("registered_at"),
             registered_via=d.get("registered_via", "cli"),
         )
 
 
 @dataclass
-class FileCheckerConfig:
+class FileProbeConfig:
     """Stored configuration for a file-format drift check (Parquet / ORC / Avro).
 
     ``path`` is a local file or directory (e.g. a partitioned dataset). It may
@@ -381,7 +398,7 @@ class FileCheckerConfig:
     path: str
     env: list[str] = field(default_factory=list)
     file_format: str = "auto"
-    checker_type: str = "file"
+    probe_type: str = "file"
     registered_at: Optional[str] = None
     registered_via: str = "cli"
 
@@ -392,20 +409,20 @@ class FileCheckerConfig:
         return json.dumps(self.to_dict(), indent=2, default=str)
 
     @classmethod
-    def from_dict(cls, d: dict) -> "FileCheckerConfig":
+    def from_dict(cls, d: dict) -> "FileProbeConfig":
         return cls(
             schema_name=d["schema_name"],
             path=d["path"],
             env=d.get("env", []),
             file_format=d.get("file_format", "auto"),
-            checker_type=d.get("checker_type", "file"),
+            probe_type=d.get("probe_type", "file"),
             registered_at=d.get("registered_at"),
             registered_via=d.get("registered_via", "cli"),
         )
 
 
 @dataclass
-class IcebergCheckerConfig:
+class IcebergProbeConfig:
     """Stored configuration for an Iceberg table drift check.
 
     ``path`` is a local table directory, its ``metadata/`` directory, or a
@@ -415,7 +432,7 @@ class IcebergCheckerConfig:
     schema_name: str
     path: str
     env: list[str] = field(default_factory=list)
-    checker_type: str = "iceberg"
+    probe_type: str = "iceberg"
     registered_at: Optional[str] = None
     registered_via: str = "cli"
 
@@ -426,12 +443,12 @@ class IcebergCheckerConfig:
         return json.dumps(self.to_dict(), indent=2, default=str)
 
     @classmethod
-    def from_dict(cls, d: dict) -> "IcebergCheckerConfig":
+    def from_dict(cls, d: dict) -> "IcebergProbeConfig":
         return cls(
             schema_name=d["schema_name"],
             path=d["path"],
             env=d.get("env", []),
-            checker_type=d.get("checker_type", "iceberg"),
+            probe_type=d.get("probe_type", "iceberg"),
             registered_at=d.get("registered_at"),
             registered_via=d.get("registered_via", "cli"),
         )

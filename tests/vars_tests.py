@@ -14,7 +14,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from shelfard import LocalFileRegistry
-from shelfard.models import RestCheckerConfig, PostgresCheckerConfig
+from shelfard.models import RestProbeConfig, PostgresProbeConfig
 
 # ─────────────────────────────────────────────
 # Minimal test framework
@@ -195,19 +195,19 @@ test("resolve_template with no placeholders is a no-op", test_resolve_template_n
 
 
 # ─────────────────────────────────────────────
-# Checker Integration
+# Probe Integration
 # ─────────────────────────────────────────────
 
-section("Checker Integration")
+section("Probe Integration")
 
 
-def test_rest_checker_resolves_template_vars():
+def test_rest_probe_resolves_template_vars():
     with tempfile.TemporaryDirectory() as tmp:
         r = LocalFileRegistry(tmp)
         r.set_var("base_url", "http://localhost:8080")
 
-        from shelfard.tools.rest.checker import RestChecker
-        config = RestCheckerConfig(
+        from shelfard.tools.rest.probe import RestProbe
+        config = RestProbeConfig(
             schema_name="test_api",
             url="{{base_url}}/api/v1",
             headers=[],
@@ -227,23 +227,23 @@ def test_rest_checker_resolves_template_vars():
             def get_schema(self):
                 return _FakeResult()
 
-        checker = RestChecker(config, r)
-        with mock.patch("shelfard.tools.rest.checker.RestEndpointReader", _FakeReader):
-            checker.run()
+        probe = RestProbe(config, r)
+        with mock.patch("shelfard.tools.rest.probe.RestEndpointReader", _FakeReader):
+            probe.run()
 
         assert len(captured_url) == 1, "Reader was not called"
         assert captured_url[0] == "http://localhost:8080/api/v1", repr(captured_url[0])
 
-test("RestChecker resolves {{vars}} in URL before $ENV_VAR", test_rest_checker_resolves_template_vars)
+test("RestProbe resolves {{vars}} in URL before $ENV_VAR", test_rest_probe_resolves_template_vars)
 
 
-def test_postgres_checker_resolves_template_vars():
+def test_postgres_probe_resolves_template_vars():
     with tempfile.TemporaryDirectory() as tmp:
         r = LocalFileRegistry(tmp)
         r.set_var("db_host", "localhost")
 
-        from shelfard.tools.postgres.checker import PostgresChecker
-        config = PostgresCheckerConfig(
+        from shelfard.tools.postgres.probe import PostgresProbe
+        config = PostgresProbeConfig(
             schema_name="test_db",
             dsn="postgresql://user@{{db_host}}/mydb",
             env=[],
@@ -263,14 +263,14 @@ def test_postgres_checker_resolves_template_vars():
             def get_schema(self):
                 return _FakeResult()
 
-        checker = PostgresChecker(config, r)
+        probe = PostgresProbe(config, r)
         with mock.patch("shelfard.tools.postgres.reader.PostgresReader", _FakeReader):
-            checker.run()
+            probe.run()
 
         assert len(captured_dsn) == 1, "Reader was not called"
         assert captured_dsn[0] == "postgresql://user@localhost/mydb", repr(captured_dsn[0])
 
-test("PostgresChecker resolves {{vars}} in DSN", test_postgres_checker_resolves_template_vars)
+test("PostgresProbe resolves {{vars}} in DSN", test_postgres_probe_resolves_template_vars)
 
 
 # ─────────────────────────────────────────────

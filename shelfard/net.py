@@ -1,5 +1,5 @@
 """
-Hardened HTTP fetching for REST readers and checkers.
+Hardened HTTP fetching for REST readers and probes.
 
 ``fetch(url, headers, guard_private=...)`` differs from a plain ``requests.get`` in two ways:
 
@@ -11,7 +11,7 @@ Hardened HTTP fetching for REST readers and checkers.
 
 2. **Optional connection-time address guard** (``guard_private=True``). The peer address
    of every TCP connection is checked *after* connecting, on the actual socket. A host
-   that resolved to a public IP when the checker was registered but resolves to
+   that resolved to a public IP when the probe was registered but resolves to
    ``127.0.0.1`` or ``169.254.169.254`` now (DNS rebinding) is refused, and so is every
    redirect hop. Environment proxies are ignored in this mode so the checked peer is
    the real destination.
@@ -54,7 +54,7 @@ class _GuardMixin:
             raise NewConnectionError(
                 self,  # type: ignore[arg-type]
                 f"Blocked connection to internal address {peer_ip} for host {self.host!r} "  # type: ignore[attr-defined]
-                f"(checkers registered through MCP may only reach public hosts)",
+                f"(probes registered through MCP may only reach public hosts)",
             )
         return sock
 

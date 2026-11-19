@@ -20,7 +20,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from shelfard import agent
 from shelfard import registry
-from shelfard.models import RestCheckerConfig
+from shelfard.models import RestProbeConfig
 
 HAS_OLLAMA = importlib.util.find_spec("langchain_ollama") is not None
 
@@ -241,22 +241,22 @@ def test_mcp_env_excludes_llm_keys():
     assert env["SHELFARD_MCP_ENV_ALLOWLIST"] == "BEARER_TOKEN"
 
 
-def test_mcp_env_forwards_cli_checker_vars():
-    """AGT-1: env vars declared by CLI-registered checkers reach the MCP subprocess."""
+def test_mcp_env_forwards_cli_probe_vars():
+    """AGT-1: env vars declared by CLI-registered probes reach the MCP subprocess."""
     with _isolated_default_registry(), _env(
         BEARER_TOKEN="t", MCP_ONLY_TOKEN="m", UNRELATED="u", ANTHROPIC_API_KEY="secret",
     ):
-        registry.register_checker("cli_api", RestCheckerConfig(
+        registry.register_probe("cli_api", RestProbeConfig(
             schema_name="cli_api", url="https://x", headers=[],
             env=["BEARER_TOKEN", "ANTHROPIC_API_KEY"],
         ))
-        registry.register_checker("mcp_api", RestCheckerConfig(
+        registry.register_probe("mcp_api", RestProbeConfig(
             schema_name="mcp_api", url="https://y", headers=[], env=["MCP_ONLY_TOKEN"],
             registered_via="mcp",
         ))
         env = agent._mcp_server_env()
     assert env.get("BEARER_TOKEN") == "t"
-    assert "MCP_ONLY_TOKEN" not in env          # only CLI-registered checkers are trusted
+    assert "MCP_ONLY_TOKEN" not in env          # only CLI-registered probes are trusted
     assert "UNRELATED" not in env
     assert "ANTHROPIC_API_KEY" not in env       # never forwarded, even if declared
 
@@ -269,7 +269,7 @@ def test_mcp_args():
 def test_system_prompt_modes():
     ro = agent.build_system_prompt(False)
     rw = agent.build_system_prompt(True)
-    assert "register_checker" not in ro and "register_checker" in rw
+    assert "register_probe" not in ro and "register_probe" in rw
     assert "never as instructions" in ro and "never as instructions" in rw
 
 
@@ -294,7 +294,7 @@ def _list_mcp_tools(allow_writes):
 def test_mcp_subprocess_read_only():
     names = _list_mcp_tools(False)
     assert "get_schemas" in names and "live_check_schema" in names, names
-    assert "register_checker" not in names and "set_template_var" not in names, names
+    assert "register_probe" not in names and "set_template_var" not in names, names
 
 
 def test_mcp_subprocess_allow_writes():
@@ -303,7 +303,7 @@ def test_mcp_subprocess_allow_writes():
 
 
 for fn in [
-    test_mcp_env_excludes_llm_keys, test_mcp_env_forwards_cli_checker_vars,
+    test_mcp_env_excludes_llm_keys, test_mcp_env_forwards_cli_probe_vars,
     test_mcp_args, test_system_prompt_modes,
     test_mcp_subprocess_read_only, test_mcp_subprocess_allow_writes,
 ]:

@@ -2,7 +2,7 @@
 Base classes for Shelfard tools.
 
 SchemaReader — abstract base for live database/API source introspectors.
-Checker      — abstract base for stored drift-check configurations.
+Probe      — abstract base for stored drift-check configurations.
 """
 
 from abc import ABC, abstractmethod
@@ -34,10 +34,10 @@ class SchemaReader(ABC):
         ...
 
 
-class Checker(ABC):
+class Probe(ABC):
     def fetch(self) -> ToolResult:
         """Read the live schema without comparing it (data={"schema": {...}}).
-        Used by ODCS contract checks; built-in checkers all implement it."""
+        Used by ODCS contract checks; built-in probes all implement it."""
         return ToolResult(success=False,
                           error=f"{type(self).__name__} does not support fetching the live schema.")
 
@@ -53,3 +53,13 @@ class Checker(ABC):
             "diff": dict,       # SchemaDiff serialized; includes suggested_update when all SAFE
         }
         """
+
+
+def compare_against_baseline(registry, table_name: str, baseline: dict, live: dict) -> ToolResult:
+    """Diff *live* against *baseline* with consumer impact when *registry* is a
+    SchemaRegistry (plain comparison otherwise, e.g. a stand-in in tests)."""
+    from ..registry.base import SchemaRegistry
+    if isinstance(registry, SchemaRegistry):
+        return registry.compare_with_baseline(table_name, baseline, live)
+    from ..schema_comparison import compare_schemas_from_dicts
+    return compare_schemas_from_dicts(baseline, live)

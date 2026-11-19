@@ -1,5 +1,5 @@
 """
-Unit tests for the PostgreSQL reader and checker.
+Unit tests for the PostgreSQL reader and probe.
 
 Uses unittest.mock to simulate psycopg2 — no live database needed.
 
@@ -17,7 +17,7 @@ from unittest.mock import MagicMock, patch
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from shelfard import LocalFileRegistry
-from shelfard.models import PostgresCheckerConfig
+from shelfard.models import PostgresProbeConfig
 
 # ─────────────────────────────────────────────
 # Minimal test framework
@@ -282,14 +282,14 @@ test("PostgresReader.list_tables returns tables and views", test_postgres_list_t
 
 
 # ─────────────────────────────────────────────
-# PostgresCheckerConfig
+# PostgresProbeConfig
 # ─────────────────────────────────────────────
 
-section("PostgresCheckerConfig")
+section("PostgresProbeConfig")
 
 
-def test_postgres_checker_config_roundtrip():
-    config = PostgresCheckerConfig(
+def test_postgres_probe_config_roundtrip():
+    config = PostgresProbeConfig(
         schema_name="orders",
         dsn="postgresql://user:$PG_PASS@host/db",
         env=["PG_PASS"],
@@ -297,11 +297,11 @@ def test_postgres_checker_config_roundtrip():
         db_schema="public",
     )
     d = config.to_dict()
-    assert d["checker_type"] == "postgres"
+    assert d["probe_type"] == "postgres"
     assert d["table"] == "orders"
     assert d["query"] is None
 
-    restored = PostgresCheckerConfig.from_dict(d)
+    restored = PostgresProbeConfig.from_dict(d)
     assert restored.schema_name == "orders"
     assert restored.dsn == "postgresql://user:$PG_PASS@host/db"
     assert restored.env == ["PG_PASS"]
@@ -310,11 +310,11 @@ def test_postgres_checker_config_roundtrip():
     assert restored.sample_size == 100
     assert restored.db_schema == "public"
 
-test("PostgresCheckerConfig roundtrip: to_dict → from_dict", test_postgres_checker_config_roundtrip)
+test("PostgresProbeConfig roundtrip: to_dict → from_dict", test_postgres_probe_config_roundtrip)
 
 
-def test_postgres_checker_config_query_mode():
-    config = PostgresCheckerConfig(
+def test_postgres_probe_config_query_mode():
+    config = PostgresProbeConfig(
         schema_name="report",
         dsn="postgresql://user:$PG_PASS@host/db",
         env=["PG_PASS"],
@@ -322,61 +322,61 @@ def test_postgres_checker_config_query_mode():
         sample_size=50,
     )
     d = config.to_dict()
-    restored = PostgresCheckerConfig.from_dict(d)
+    restored = PostgresProbeConfig.from_dict(d)
     assert restored.table is None
     assert restored.query == config.query
     assert restored.sample_size == 50
 
-test("PostgresCheckerConfig query mode serialises correctly", test_postgres_checker_config_query_mode)
+test("PostgresProbeConfig query mode serialises correctly", test_postgres_probe_config_query_mode)
 
 
-def test_postgres_checker_register_and_get():
-    """Register a postgres checker in the registry and retrieve it."""
+def test_postgres_probe_register_and_get():
+    """Register a postgres probe in the registry and retrieve it."""
     with tempfile.TemporaryDirectory() as tmp:
         r = LocalFileRegistry(tmp)
-        config = PostgresCheckerConfig(
+        config = PostgresProbeConfig(
             schema_name="pg_orders",
             dsn="postgresql://user:$PG_PASS@host/db",
             env=["PG_PASS"],
             table="orders",
         )
-        reg = r.register_checker("pg_orders", config)
+        reg = r.register_probe("pg_orders", config)
         assert reg.success
 
-        get = r.get_checker("pg_orders")
+        get = r.get_probe("pg_orders")
         assert get.success
-        c = get.data["checker"]
-        assert c["checker_type"] == "postgres"
+        c = get.data["probe"]
+        assert c["probe_type"] == "postgres"
         assert c["dsn"] == "postgresql://user:$PG_PASS@host/db"
         assert c["table"] == "orders"
         assert "PG_PASS" in c["env"]
 
-test("register_checker + get_checker for postgres type", test_postgres_checker_register_and_get)
+test("register_probe + get_probe for postgres type", test_postgres_probe_register_and_get)
 
 
-def test_postgres_checker_run_missing_env():
-    """run_checker dispatches to PostgresChecker; missing env var returns informative error."""
+def test_postgres_probe_run_missing_env():
+    """run_probe dispatches to PostgresProbe; missing env var returns informative error."""
     with tempfile.TemporaryDirectory() as tmp:
         r = LocalFileRegistry(tmp)
-        config = PostgresCheckerConfig(
+        config = PostgresProbeConfig(
             schema_name="pg_test",
             dsn="postgresql://user:$SHELFARD_TEST_PG_PASS@host/db",
             env=["SHELFARD_TEST_PG_PASS"],
             table="orders",
         )
-        r.register_checker("pg_test", config)
+        r.register_probe("pg_test", config)
 
         # Ensure the env var is not set
         env_backup = os.environ.pop("SHELFARD_TEST_PG_PASS", None)
         try:
-            result = r.run_checker("pg_test")
+            result = r.run_probe("pg_test")
             assert not result.success
             assert "SHELFARD_TEST_PG_PASS" in result.error
         finally:
             if env_backup is not None:
                 os.environ["SHELFARD_TEST_PG_PASS"] = env_backup
 
-test("run_checker postgres: dispatches to PostgresChecker, missing env → error", test_postgres_checker_run_missing_env)
+test("run_probe postgres: dispatches to PostgresProbe, missing env → error", test_postgres_probe_run_missing_env)
 
 
 # ─────────────────────────────────────────────

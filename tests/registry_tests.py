@@ -18,7 +18,6 @@ from shelfard import (
     get_sqlite_schema, register_schema, get_registered_schema,
     compare_schemas_from_dicts,
 )
-from shelfard.models import SchemaDiff, ColumnChange
 import shelfard.registry as registry
 
 # ─────────────────────────────────────────────
@@ -217,9 +216,11 @@ def test_subscribe_consumer_full():
         result = r.subscribe_consumer("analytics", "users")
         assert result.success, result.error
         assert result.data["column_count"] == 4
-        assert result.data["subscribed_columns"] is None
+        proj = result.data["projection"]
+        assert proj["full"] is True
+        assert proj["columns"] == ["id", "email", "name", "created_at"]
 
-test("full subscription snapshots all columns", test_subscribe_consumer_full)
+test("full subscription projects all top-level columns", test_subscribe_consumer_full)
 
 
 def test_subscribe_consumer_projection():
@@ -229,17 +230,18 @@ def test_subscribe_consumer_projection():
         result = r.subscribe_consumer("reporting", "users", columns=["email", "created_at"])
         assert result.success, result.error
         assert result.data["column_count"] == 2
-        assert result.data["subscribed_columns"] == ["email", "created_at"]
 
-        sub_result = r.get_consumer_subscription("reporting", "users")
-        assert sub_result.success
-        sub = sub_result.data["subscription"]
-        assert len(sub["schema"]["columns"]) == 2
-        col_names = [c["name"] for c in sub["schema"]["columns"]]
-        assert "email" in col_names
-        assert "created_at" in col_names
+        sub = r.get_consumer_subscription("reporting", "users").data["subscription"]
+        assert sub["columns"] == ["email", "created_at"]
+        assert [c["name"] for c in sub["expected"]] == ["email", "created_at"]
+        assert sub["expected"][0]["col_type"] == "varchar"
+        # Unversioned: subscribing again overwrites.
+        r.subscribe_consumer("reporting", "users", columns=["id"])
+        sub = r.get_consumer_subscription("reporting", "users").data["subscription"]
+        assert sub["columns"] == ["id"] and "versions" not in sub
 
-test("projection subscription captures only requested columns", test_subscribe_consumer_projection)
+test("projection saves the expected shape of the requested columns (overwritten)",
+     test_subscribe_consumer_projection)
 
 
 def test_subscribe_consumer_unknown_source():
@@ -248,8 +250,11 @@ def test_subscribe_consumer_unknown_source():
         result = r.subscribe_consumer("analytics", "nonexistent")
         assert not result.success
         assert "nonexistent" in result.error.lower() or "not registered" in result.error.lower()
+        r.register_schema("users", _make_users_schema())
+        result = r.subscribe_consumer("analytics", "users", columns=["email", "nope"])
+        assert not result.success and "nope" in result.error
 
-test("subscribe to unregistered source → helpful error", test_subscribe_consumer_unknown_source)
+test("unregistered source or unknown column → error", test_subscribe_consumer_unknown_source)
 
 
 def test_get_consumers_for_table():
@@ -259,69 +264,35 @@ def test_get_consumers_for_table():
         r.subscribe_consumer("analytics",  "users")
         r.subscribe_consumer("reporting",  "users", columns=["email"])
         result = r.get_consumers_for_table("users")
-        assert result.success
+        assert result.success and result.data["total"] == 2
         consumers = {c["consumer"]: c for c in result.data["consumers"]}
-        assert "analytics" in consumers
-        assert "reporting" in consumers
-        assert consumers["analytics"]["subscribed_columns"] is None
-        assert consumers["reporting"]["subscribed_columns"] == ["email"]
+        assert consumers["analytics"]["full"] is True
+        assert consumers["reporting"]["columns"] == ["email"]
+        assert r.unsubscribe_consumer("reporting", "users").success
+        assert r.get_consumers_for_table("users").data["total"] == 1
+        assert not r.unsubscribe_consumer("reporting", "users").success
 
-test("get_consumers_for_table lists all subscribers", test_get_consumers_for_table)
+test("get_consumers_for_table lists projections; unsubscribe removes one", test_get_consumers_for_table)
 
 
-def test_get_consumers_affected_full_subscription():
+def test_consumer_impact_projection():
     with tempfile.TemporaryDirectory() as tmp:
         r = LocalFileRegistry(tmp)
-        r.register_schema("users", _make_users_schema())
-        r.subscribe_consumer("analytics", "users")  # full subscription
-
-        diff = SchemaDiff(
-            table_name="users",
-            old_schema_version="v1",
-            new_schema_version="v2",
-            changes=[ColumnChange(
-                change_type=ChangeType.COLUMN_REMOVED,
-                column_name="name",
-                severity=ChangeSeverity.BREAKING,
-                reasoning="Column removed",
-            )],
-            overall_severity=ChangeSeverity.BREAKING,
-        )
-        result = r.get_consumers_affected_by_diff("users", diff)
-        assert result.success
-        affected = {a["consumer"]: a for a in result.data["affected"]}
-        assert "analytics" in affected
-        assert len(affected["analytics"]["impacted_changes"]) == 1
-
-test("full subscriber is always affected by any change", test_get_consumers_affected_full_subscription)
-
-
-def test_get_consumers_affected_projection():
-    with tempfile.TemporaryDirectory() as tmp:
-        r = LocalFileRegistry(tmp)
-        r.register_schema("users", _make_users_schema())
+        old = _make_users_schema()
+        r.register_schema("users", old)
         r.subscribe_consumer("email_svc", "users", columns=["email"])
         r.subscribe_consumer("name_svc",  "users", columns=["name"])
+        new = TableSchema("users", [c for c in old.columns if c.name != "name"], source="test")
+        result = r.compare_with_baseline("users", old.to_dict(), new.to_dict())
+        assert result.success, result.error
+        d = result.data["diff"]
+        (change,) = d["changes"]
+        assert change["consumer_impact"] == "consumer_constrained"
+        assert change["consumers"] == [{"consumer": "name_svc", "severity": "BREAKING"}]
+        assert d["consumer_summary"]["total"] == 2 and d["consumer_summary"]["affected"] == 1
+        assert d["suggested_update"] is None             # a consumer reads the removed column
 
-        diff = SchemaDiff(
-            table_name="users",
-            old_schema_version="v1",
-            new_schema_version="v2",
-            changes=[ColumnChange(
-                change_type=ChangeType.COLUMN_REMOVED,
-                column_name="name",
-                severity=ChangeSeverity.BREAKING,
-                reasoning="Column removed",
-            )],
-            overall_severity=ChangeSeverity.BREAKING,
-        )
-        result = r.get_consumers_affected_by_diff("users", diff)
-        assert result.success
-        affected = {a["consumer"]: a for a in result.data["affected"]}
-        assert "name_svc" in affected          # subscribed to 'name' — affected
-        assert "email_svc" not in affected     # subscribed to 'email' only — not affected
-
-test("projection subscriber only affected when their columns change", test_get_consumers_affected_projection)
+test("projection subscriber only affected when their columns change", test_consumer_impact_projection)
 
 
 # ─────────────────────────────────────────────

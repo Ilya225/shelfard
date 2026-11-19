@@ -267,13 +267,13 @@ def _registry_with(schema):
     return tmp, reg
 
 
-def test_accept_safe_update_increments_version():
+def test_accept_update_increments_version():
     tmp, reg = _registry_with(rest(infer("name", None)))
     with tmp:
         base = reg.get_registered_schema("orders").data
         assert base["version_number"] == 1 and base["version_count"] == 1
         d = diff(TableSchema.from_dict(base["schema"]), rest(infer("name", "Ann")))
-        res = reg.accept_safe_update("orders", d, base["version"])
+        res = reg.accept_update("orders", d, base["version"])
         assert res.success, res.error
         assert res.data["version_count"] == 2 and res.data["explanation"], res.data
         latest = reg.get_registered_schema("orders").data
@@ -283,7 +283,7 @@ def test_accept_safe_update_increments_version():
         assert diff(TableSchema.from_dict(latest["schema"]), rest(infer("name", "Ann")))["changes"] == []
 
 
-test("accept_safe_update registers the merged schema as version 2", test_accept_safe_update_increments_version)
+test("accept_update registers the merged schema as version 2", test_accept_update_increments_version)
 
 
 def test_accept_refuses_unsafe_or_stale():
@@ -291,16 +291,16 @@ def test_accept_refuses_unsafe_or_stale():
     with tmp:
         base = reg.get_registered_schema("orders").data
         breaking = diff(db(C("a", T.INTEGER)), db())
-        res = reg.accept_safe_update("orders", breaking, base["version"])
-        assert not res.success and "No safe update" in res.error
+        res = reg.accept_update("orders", breaking, base["version"])
+        assert not res.success and "No update to apply" in res.error
         safe = diff(db(C("a", T.INTEGER)), db(C("a", T.BIGINT)))
         assert reg.register_schema("orders", db(C("a", T.INTEGER), captured_at="later")).success
-        res = reg.accept_safe_update("orders", safe, base["version"])
+        res = reg.accept_update("orders", safe, base["version"])
         assert not res.success and "changed since this check" in res.error, res.error
         assert reg.get_registered_schema("orders").data["version_count"] == 2
 
 
-test("accept_safe_update refuses BREAKING diffs and stale baselines", test_accept_refuses_unsafe_or_stale)
+test("accept_update refuses BREAKING diffs and stale baselines", test_accept_refuses_unsafe_or_stale)
 
 
 def test_impact_analysis_array_names():
@@ -310,9 +310,12 @@ def test_impact_analysis_array_names():
         reg.subscribe_consumer("bi", "orders", ["tags"])
         d = compare_schemas(rest(infer("tags", [1]), infer("id", 1)),
                             rest(infer("tags", ["a"]), infer("id", 1))).data["diff"]
-        changes = [ColumnChange(**c) for c in d["changes"]]
-        res = reg.get_consumers_affected_by_diff("orders", SchemaDiff("orders", None, None, changes))
-        assert [a["consumer"] for a in res.data["affected"]] == ["bi"], res.data
+        res = reg.assess_consumer_impact("orders", d, rest(infer("tags", [1]), infer("id", 1)).to_dict(),
+                                         rest(infer("tags", ["a"]), infer("id", 1)).to_dict())
+        annotated = res.data["diff"]
+        assert annotated["changes"][0]["column_name"] == "tags[]"
+        assert [c["consumer"] for c in annotated["changes"][0]["consumers"]] == ["bi"], annotated
+        assert annotated["consumer_summary"]["affected"] == 1
 
 
 test("impact analysis maps 'tags[]' changes to the 'tags' subscription", test_impact_analysis_array_names)
@@ -322,7 +325,7 @@ test("impact analysis maps 'tags[]' changes to the 'tags' subscription", test_im
 # CLI and MCP
 # ─────────────────────────────────────────────
 
-print("\nCLI --update and MCP accept_safe_schema_update")
+print("\nCLI --update and MCP accept_schema_update")
 
 
 def test_cli_update_flow():
@@ -365,11 +368,21 @@ def test_cli_update_ignored_for_breaking():
             out = io.StringIO()
             with redirect_stdout(out):
                 code = cli.cmd_rest_check(args)
-        assert code == 1 and "--update ignored" in out.getvalue(), out.getvalue()
+        # No consumers: the removal is "unaffected", which --update alone won't apply.
+        assert code == 1 and "--update alone only applies all-SAFE" in out.getvalue(), out.getvalue()
         assert registry.get_registered_schema("orders").data["version_count"] == 1
+        registry.register_schema("orders", rest(infer("name", "Ann")))
+        registry.subscribe_consumer("crm", "orders", ["name"])
+        with mock.patch.object(cli, "RestEndpointReader", return_value=live):
+            out = io.StringIO()
+            with redirect_stdout(out):
+                args.allow_unaffected = True
+                code = cli.cmd_rest_check(args)
+        assert code == 1 and "--update ignored" in out.getvalue(), out.getvalue()
+        assert registry.get_registered_schema("orders").data["version_count"] == 2
 
 
-test("--update does not apply BREAKING drift", test_cli_update_ignored_for_breaking)
+test("--update never applies BREAKING drift a consumer reads", test_cli_update_ignored_for_breaking)
 
 
 def test_mcp_accept_tool():
@@ -381,22 +394,22 @@ def test_mcp_accept_tool():
         base = registry.get_registered_schema("orders").data
         d = diff(TableSchema.from_dict(base["schema"]), rest(infer("name", "Ann")))
         fake = ToolResult(success=True, data={"diff": d, "baseline_version": base["version"]})
-        with mock.patch.object(mcp_server, "_run_checker", return_value=fake):
-            out = json.loads(mcp_server.accept_safe_schema_update("orders"))
+        with mock.patch.object(mcp_server, "_run_probe", return_value=fake):
+            out = json.loads(mcp_server.accept_schema_update("orders"))
         assert out["success"] and out["data"]["version_count"] == 2, out
-        assert mcp_server.accept_safe_schema_update in mcp_server.WRITE_TOOLS
-        assert mcp_server.accept_safe_schema_update not in mcp_server.READ_TOOLS
+        assert mcp_server.accept_schema_update in mcp_server.WRITE_TOOLS
+        assert mcp_server.accept_schema_update not in mcp_server.READ_TOOLS
 
 
-test("MCP accept_safe_schema_update re-runs the check and saves version 2", test_mcp_accept_tool)
+test("MCP accept_schema_update re-runs the check and saves version 2", test_mcp_accept_tool)
 
 
 def test_agent_requires_approval():
     from shelfard import agent
-    assert "accept_safe_schema_update" in agent.WRITE_TOOLS
+    assert "accept_schema_update" in agent.WRITE_TOOLS
 
 
-test("agent asks for approval before accept_safe_schema_update", test_agent_requires_approval)
+test("agent asks for approval before accept_schema_update", test_agent_requires_approval)
 
 
 # ─────────────────────────────────────────────

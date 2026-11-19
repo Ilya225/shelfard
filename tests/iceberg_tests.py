@@ -1,5 +1,5 @@
 """
-Tests for the Iceberg table reader and checker.
+Tests for the Iceberg table reader and probe.
 
 Iceberg table metadata is written by hand (it is plain JSON), so no Spark,
 JVM or pyiceberg is needed. `scripts/spark_fixtures.py` produces a real
@@ -19,7 +19,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from shelfard import (
-    ColumnType, IcebergCheckerConfig, LocalFileRegistry,
+    ColumnType, IcebergProbeConfig, LocalFileRegistry,
     get_iceberg_schema, list_iceberg_tables, compare_schemas_from_dicts,
 )
 from shelfard.cli import _schema_from_result
@@ -217,10 +217,10 @@ test("format v1 metadata (single schema, partition-spec)", test_iceberg_format_v
 
 
 # ─────────────────────────────────────────────
-# Reader / checker plumbing
+# Reader / probe plumbing
 # ─────────────────────────────────────────────
 
-section("Reader & checker")
+section("Reader & probe")
 
 
 def test_errors(tmp):
@@ -261,7 +261,7 @@ def test_schema_evolution_drift(tmp):
 test("older metadata.json vs current: evolution is classified", test_schema_evolution_drift)
 
 
-def test_checker_roundtrip(tmp):
+def test_probe_roundtrip(tmp):
     reg = LocalFileRegistry(tmp / "registry")
     old = iceberg_metadata([ICE_SCHEMA_0], current_id=0)
     root = write_iceberg_table(tmp / "wh" / "db" / "orders", {"v1.metadata.json": old}, hint="1")
@@ -269,35 +269,35 @@ def test_checker_roundtrip(tmp):
     base = get_iceberg_schema(str(root), "orders")
     assert reg.register_schema("orders", _schema_from_result(base)).success
     assert reg.set_var("warehouse", str(tmp / "wh")).success
-    cfg = IcebergCheckerConfig(schema_name="orders", path="{{warehouse}}/db/orders")
-    assert reg.register_checker("orders", cfg).success
-    assert reg.get_all_checkers().data["checkers"][0]["checker_type"] == "iceberg"
+    cfg = IcebergProbeConfig(schema_name="orders", path="{{warehouse}}/db/orders")
+    assert reg.register_probe("orders", cfg).success
+    assert reg.get_all_probes().data["probes"][0]["probe_type"] == "iceberg"
 
-    r = reg.run_checker("orders")
+    r = reg.run_probe("orders")
     assert r.success, r.error
     assert r.data["diff"]["changes"] == []
 
     # A writer commits a schema change: new metadata version + updated hint.
     (root / "metadata" / "v2.metadata.json").write_text(json.dumps(_ice_v2()))
     (root / "metadata" / "version-hint.text").write_text("2")
-    r = reg.run_checker("orders")
+    r = reg.run_probe("orders")
     assert r.success, r.error
     assert r.data["metadata_file"].endswith("v2.metadata.json")
     assert "status" in [c["column_name"] for c in r.data["diff"]["changes"]]
 
-test("IcebergChecker via registry: {{var}} path, no drift, then a new commit", test_checker_roundtrip)
+test("IcebergProbe via registry: {{var}} path, no drift, then a new commit", test_probe_roundtrip)
 
 
-def test_checker_env(tmp):
+def test_probe_env(tmp):
     reg = LocalFileRegistry(tmp / "registry")
-    cfg = IcebergCheckerConfig(schema_name="orders", path="$SHELFARD_TEST_WH/db/orders",
+    cfg = IcebergProbeConfig(schema_name="orders", path="$SHELFARD_TEST_WH/db/orders",
                                env=["SHELFARD_TEST_WH"])
-    assert reg.register_checker("orders", cfg).success
+    assert reg.register_probe("orders", cfg).success
     os.environ.pop("SHELFARD_TEST_WH", None)
-    r = reg.run_checker("orders")
+    r = reg.run_probe("orders")
     assert not r.success and "SHELFARD_TEST_WH" in r.error
 
-test("IcebergChecker: missing env var → error", test_checker_env)
+test("IcebergProbe: missing env var → error", test_probe_env)
 
 
 # ─────────────────────────────────────────────

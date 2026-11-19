@@ -20,7 +20,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from shelfard import (
-    ColumnType, FileCheckerConfig, FileReader, LocalFileRegistry,
+    ColumnType, FileProbeConfig, FileReader, LocalFileRegistry,
     get_file_schema, list_file_tables,
 )
 from shelfard.tools.files import detect_format
@@ -379,10 +379,10 @@ test("drift between two Parquet files is classified", test_parquet_drift, requir
 
 
 # ─────────────────────────────────────────────
-# Reader / checker plumbing
+# Reader / probe plumbing
 # ─────────────────────────────────────────────
 
-section("Reader & checker")
+section("Reader & probe")
 
 
 def test_errors(tmp):
@@ -432,7 +432,7 @@ def test_iceberg_refused(tmp):
 test("Iceberg table / metadata file → refused with a pointer to the iceberg reader", test_iceberg_refused)
 
 
-def test_file_checker_roundtrip(tmp):
+def test_file_probe_roundtrip(tmp):
     reg = LocalFileRegistry(tmp / "registry")
     data = tmp / "data"
     data.mkdir()
@@ -442,34 +442,34 @@ def test_file_checker_roundtrip(tmp):
     from shelfard.cli import _schema_from_result
     assert reg.register_schema("orders", _schema_from_result(base)).success
     assert reg.set_var("data_root", str(data)).success
-    cfg = FileCheckerConfig(schema_name="orders", path="{{data_root}}/orders.avro")
-    assert reg.register_checker("orders", cfg).success
-    assert reg.get_all_checkers().data["checkers"][0]["path"] == "{{data_root}}/orders.avro"
+    cfg = FileProbeConfig(schema_name="orders", path="{{data_root}}/orders.avro")
+    assert reg.register_probe("orders", cfg).success
+    assert reg.get_all_probes().data["probes"][0]["path"] == "{{data_root}}/orders.avro"
 
-    r = reg.run_checker("orders")
+    r = reg.run_probe("orders")
     assert r.success, r.error
     assert r.data["diff"]["changes"] == []
 
     v2 = json.loads(json.dumps(ORDERS_AVRO))
     v2["fields"] = v2["fields"][:-1]                      # drop "raw"
     write_avro(data / "orders.avro", v2)
-    r = reg.run_checker("orders")
+    r = reg.run_probe("orders")
     assert r.success, r.error
     assert [c["column_name"] for c in r.data["diff"]["changes"]] == ["raw"]
 
-test("FileChecker via registry: {{var}} path, no drift, then drift", test_file_checker_roundtrip)
+test("FileProbe via registry: {{var}} path, no drift, then drift", test_file_probe_roundtrip)
 
 
-def test_file_checker_env(tmp):
+def test_file_probe_env(tmp):
     reg = LocalFileRegistry(tmp / "registry")
-    cfg = FileCheckerConfig(schema_name="orders", path="$SHELFARD_TEST_DATA/o.avro",
+    cfg = FileProbeConfig(schema_name="orders", path="$SHELFARD_TEST_DATA/o.avro",
                             env=["SHELFARD_TEST_DATA"])
-    assert reg.register_checker("orders", cfg).success
+    assert reg.register_probe("orders", cfg).success
     os.environ.pop("SHELFARD_TEST_DATA", None)
-    r = reg.run_checker("orders")
+    r = reg.run_probe("orders")
     assert not r.success and "SHELFARD_TEST_DATA" in r.error
 
-test("FileChecker: missing env var → error", test_file_checker_env)
+test("FileProbe: missing env var → error", test_file_probe_env)
 
 
 # ─────────────────────────────────────────────

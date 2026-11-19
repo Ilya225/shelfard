@@ -12,10 +12,13 @@ Usage:
   shelfard iceberg list     <warehouse-dir>
   shelfard odcs export   <name> [--version N] [--format json|yaml] [--out FILE]
   shelfard odcs import   <contract> [--name-prefix PREFIX]
-  shelfard odcs check    <contract> (--checker NAME | --name NAME) [--object OBJ] [--update]
+  shelfard odcs check    <contract> (--probe NAME | --name NAME) [--object OBJ] [--update]
   shelfard show          <table>
   shelfard list          {schemas,subscriptions}
-  shelfard subscribe     <table> --consumer NAME [--columns COL1,COL2,...]
+  shelfard subscribe     <table> --consumer NAME [--columns PATH1,PATH2,...]
+  shelfard unsubscribe   <table> --consumer NAME
+  shelfard consumers     <table>
+  shelfard consumer refresh <table> --consumer NAME
   shelfard agent
   shelfard --help
 """
@@ -27,15 +30,16 @@ import sys
 
 from shelfard import (
     ColumnSchema, RestEndpointReader, PostgresReader, TableSchema,
-    compare_schemas_from_dicts, get_registered_schema, register_schema,
+    get_registered_schema, register_schema,
     get_all_schemas, get_all_consumers, subscribe_consumer,
-    RestCheckerConfig, PostgresCheckerConfig, FileCheckerConfig, FileReader,
-    list_file_tables, IcebergCheckerConfig, IcebergReader, list_iceberg_tables,
-    register_checker, get_checker, get_all_checkers, run_checker,
-    set_var, get_var, list_vars, delete_var, accept_safe_update,
+    RestProbeConfig, PostgresProbeConfig, FileProbeConfig, FileReader,
+    list_file_tables, IcebergProbeConfig, IcebergReader, list_iceberg_tables,
+    register_probe, get_probe, get_all_probes, run_probe,
+    set_var, get_var, list_vars, delete_var, accept_update,
+    unsubscribe_consumer, refresh_consumer, get_consumers_for_table,
 )
 from shelfard import odcs
-from shelfard.models import ChangeSeverity, ChangeType
+from shelfard.models import ChangeSeverity, ChangeType, ConsumerImpact
 from shelfard.registry import _default as _registry
 from shelfard.security import query_template_error
 
@@ -99,10 +103,72 @@ def _schema_from_result(result) -> TableSchema:
     )
 
 
-def _print_diff(schema_name: str, diff: dict, baseline_version: str) -> None:
+def _sev_colour(sev, text: str) -> str:
+    if sev == ChangeSeverity.BREAKING:
+        return red(text)
+    if sev == ChangeSeverity.WARNING:
+        return yellow(text)
+    return green(text)
+
+
+_SEV_ORDER = (ChangeSeverity.BREAKING, ChangeSeverity.WARNING, ChangeSeverity.SAFE)
+
+
+def _impact_label(change: dict) -> str:
+    """Per-change label suffix: never lists consumers (there may be hundreds)."""
+    impact = change.get("consumer_impact")
+    if impact is None:
+        return ""
+    if impact == ConsumerImpact.NO_CONSUMERS:
+        return " · no consumers"
+    return f" · consumer constrained ({len(change.get('consumers', []))})"
+
+
+def _severity_counts(entries: list[dict]) -> str:
+    """``[{severity}, …]`` → ``"1 BREAKING, 3 SAFE"`` (coloured, worst first)."""
+    counts = {s: 0 for s in _SEV_ORDER}
+    for e in entries:
+        counts[ChangeSeverity(e["severity"])] += 1
+    return ", ".join(_sev_colour(s, f"{n} {s.value}") for s, n in counts.items() if n)
+
+
+def _consumer_list(entries: list[dict]) -> str:
+    """``[{consumer, severity}, …]`` → ``"crm BREAKING, report SAFE"`` (coloured)."""
+    return ", ".join(_sev_colour(e["severity"], f"{e['consumer']} {ChangeSeverity(e['severity']).value}")
+                     for e in entries)
+
+
+def _print_consumers(diff: dict, details: bool = False) -> None:
+    """Consumer counts after a diff; individual consumers only with ``details``."""
+    summary = diff.get("consumer_summary")
+    if summary is None:
+        return
+    table = diff["table_name"]
+    if diff["changes"]:
+        counts = _severity_counts(summary["consumers"])
+        print(f"  Consumers: {summary['affected']} of {summary['total']} affected"
+              + (f" — {counts}" if counts else ""))
+        if details:
+            for c in summary["consumers"]:
+                print(f"    • {_sev_colour(c['severity'], ChangeSeverity(c['severity']).value)} "
+                      f"{c['consumer']}: {', '.join(c['changes'])}")
+    outdated = summary.get("outdated") or []
+    if outdated:
+        print(f"  Outdated projections: {len(outdated)} ({_severity_counts(outdated)}) — consumers can "
+              f"refresh with 'shelfard consumer refresh {table} --consumer NAME'")
+        if details:
+            for o in outdated:
+                print(f"    • {_sev_colour(o['severity'], ChangeSeverity(o['severity']).value)} "
+                      f"{o['consumer']}: {', '.join(o['changes'])}")
+    if not details and (summary["consumers"] and diff["changes"] or outdated):
+        print(f"  Run with --details to list them, or 'shelfard consumers {table}'.")
+
+
+def _print_diff(schema_name: str, diff: dict, baseline_version: str, details: bool = False) -> None:
     if not diff["changes"]:
         print(green(f"✓ No drift detected for '{schema_name}'") +
               f"  (last snapshot: {baseline_version})")
+        _print_consumers(diff, details)
         return
 
     severity = diff["overall_severity"]
@@ -115,52 +181,75 @@ def _print_diff(schema_name: str, diff: dict, baseline_version: str) -> None:
     print(f"  {diff['summary']}")
     print()
 
-    for change in diff["changes"]:
-        sev = change["severity"]
-        label = f"[{ChangeSeverity(sev).value:<8}]"
-        if sev == ChangeSeverity.BREAKING:
-            label = red(label)
-        elif sev == ChangeSeverity.WARNING:
-            label = yellow(label)
-        else:
-            label = green(label)
-
+    labels = [f"[{ChangeSeverity(c['severity']).value}{_impact_label(c)}]" for c in diff["changes"]]
+    width = max(len(label) for label in labels)
+    for change, label in zip(diff["changes"], labels):
+        label = _sev_colour(change["severity"], label.ljust(width))
         print(f"  {label} {ChangeType(change['change_type']).value:<25} '{change['column_name']}'")
         print(f"             {change['reasoning']}")
+        if details and change.get("consumers"):
+            print(f"             Consumers: {_consumer_list(change['consumers'])}")
         print()
+    _print_consumers(diff, details)
 
 
-def _finish_check(schema_name: str, diff: dict, baseline: dict, update: bool) -> int:
-    """Print the diff and, when every change is SAFE, the suggested baseline
-    update — applying it if ``update`` is set. ``baseline`` is the data of a
-    get_registered_schema() result (or a checker result's baseline fields).
+def _finish_check(schema_name: str, diff: dict, baseline: dict, update: bool,
+                  allow_unaffected: bool = False, details: bool = False) -> int:
+    """Print the diff and the suggested baseline update — applying it if
+    ``update`` is set. Updates of kind "unaffected" (WARNING/BREAKING changes no
+    consumer reads) also need ``allow_unaffected``. ``details`` lists individual
+    consumers (otherwise only counts are shown). ``baseline`` is the data of a
+    get_registered_schema() result (or a probe result's baseline fields).
 
     Exit codes: 0 no drift or update applied, 1 drift, 2 update failed.
     """
-    _print_diff(schema_name, diff, baseline["version"])
+    _print_diff(schema_name, diff, baseline["version"], details)
     if not diff["changes"]:
         return 0
     suggestion = diff.get("suggested_update")
     if not suggestion:
         if update:
-            print(yellow("  --update ignored: only all-SAFE changes are applied automatically. "
-                         "Review the changes, then re-snapshot to accept them."))
+            print(yellow("  --update ignored: WARNING/BREAKING changes affect consumers. "
+                         "Review them, then re-snapshot to accept."))
         return 1
 
+    kind = suggestion.get("kind", "safe")
     current = baseline.get("version_number")
     target = f"version {current} → {current + 1}" if current else "a new version"
+    print()
     print(f"  Suggested baseline update ({target}):")
     for line in suggestion.get("explanation", []):
         print(f"    • {line}")
+    if kind == "unaffected":
+        n = sum(1 for c in diff["changes"] if c["severity"] != ChangeSeverity.SAFE)
+        print(yellow(f"  Contains {n} WARNING/BREAKING change(s) that no consumer reads."))
+        hint = "Run the same command with --update --allow-unaffected to save it."
+    else:
+        hint = "Run the same command with --update to save it."
     if not update:
-        print("  Run the same command with --update to save it.")
+        print(f"  {hint}")
+        return 1
+    if kind == "unaffected" and not allow_unaffected:
+        print(yellow(f"  --update alone only applies all-SAFE updates. {hint}"))
         return 1
 
-    result = accept_safe_update(schema_name, diff, baseline["version"])
+    result = accept_update(schema_name, diff, baseline["version"], allow_unaffected=allow_unaffected)
     if not result.success:
         print(red(f"✗ Baseline not updated: {result.error}"))
         return 2
     print(green(f"✓ Baseline updated: '{schema_name}' is now version {result.data['version_count']}"))
+    outdated = result.data.get("outdated_consumers") or []
+    if outdated:
+        verb = "differs" if len(outdated) == 1 else "differ"
+        print(f"  Consumer projections are unchanged; {len(outdated)} now {verb} from the baseline "
+              f"({_severity_counts(outdated)}). Consumers can refresh with "
+              f"'shelfard consumer refresh {schema_name} --consumer NAME'.")
+        if details:
+            for o in outdated:
+                print(f"    • {_sev_colour(o['severity'], ChangeSeverity(o['severity']).value)} "
+                      f"{o['consumer']}: {', '.join(o['changes'])}")
+        else:
+            print(f"  Run with --details to list them, or 'shelfard consumers {schema_name}'.")
     return 0
 
 
@@ -223,7 +312,7 @@ def cmd_rest_snapshot(args) -> int:
     col_count = len(schema.columns)
     print(green(f"✓ Snapshot saved: '{schema_name}' (version {version}, {col_count} top-level columns)"))
 
-    if getattr(args, "create_checker", False):
+    if getattr(args, "create_probe", False):
         headers_list = []
         for item in args.header or []:
             if "=" not in item:
@@ -234,18 +323,18 @@ def cmd_rest_snapshot(args) -> int:
             headers_list.append({"Authorization": f"Bearer {args.bearer}"})
         header_values = [v for h in headers_list for v in h.values()]
         env = _extract_env_vars(args.url, *header_values)
-        config = RestCheckerConfig(
+        config = RestProbeConfig(
             schema_name=schema_name,
             url=args.url,
             headers=headers_list,
             env=env,
         )
-        cr = register_checker(schema_name, config)
+        cr = register_probe(schema_name, config)
         if cr.success:
             env_str = f"{len(env)} env var{'s' if len(env) != 1 else ''}"
-            print(green(f"✓ Checker registered for '{schema_name}'") + f"  (rest · {env_str})")
+            print(green(f"✓ Probe registered for '{schema_name}'") + f"  (rest · {env_str})")
         else:
-            print(yellow(f"⚠ Snapshot saved but checker registration failed: {cr.error}"))
+            print(yellow(f"⚠ Snapshot saved but probe registration failed: {cr.error}"))
 
     return 0
 
@@ -272,7 +361,8 @@ def cmd_rest_check(args) -> int:
         print(f"  Run:  shelfard rest snapshot {url} --name {args.name}")
         return 2
 
-    diff_result = compare_schemas_from_dicts(
+    diff_result = _registry.compare_with_baseline(
+        schema_name,
         baseline_result.data["schema"],
         new_result.data["schema"],
     )
@@ -281,7 +371,8 @@ def cmd_rest_check(args) -> int:
         return 2
 
     return _finish_check(schema_name, diff_result.data["diff"], baseline_result.data,
-                         getattr(args, "update", False))
+                         getattr(args, "update", False),
+                         getattr(args, "allow_unaffected", False), getattr(args, "details", False))
 
 
 # ── PostgreSQL commands ───────────────────────────────────────────────────────
@@ -327,10 +418,10 @@ def cmd_postgres_snapshot(args) -> int:
     col_count = len(schema.columns)
     print(green(f"✓ Snapshot saved: '{schema_name}' (version {version}, {col_count} top-level columns)"))
 
-    if getattr(args, "create_checker", False):
+    if getattr(args, "create_probe", False):
         templates = [args.dsn] + ([args.query] if args.query else [])
         env = _extract_env_vars(*templates)
-        config = PostgresCheckerConfig(
+        config = PostgresProbeConfig(
             schema_name=schema_name,
             dsn=args.dsn,
             env=env,
@@ -338,12 +429,12 @@ def cmd_postgres_snapshot(args) -> int:
             query=args.query or None,
             db_schema=args.db_schema,
         )
-        cr = register_checker(schema_name, config)
+        cr = register_probe(schema_name, config)
         if cr.success:
             env_str = f"{len(env)} env var{'s' if len(env) != 1 else ''}"
-            print(green(f"✓ Checker registered for '{schema_name}'") + f"  (postgres · {env_str})")
+            print(green(f"✓ Probe registered for '{schema_name}'") + f"  (postgres · {env_str})")
         else:
-            print(yellow(f"⚠ Snapshot saved but checker registration failed: {cr.error}"))
+            print(yellow(f"⚠ Snapshot saved but probe registration failed: {cr.error}"))
 
     return 0
 
@@ -378,7 +469,8 @@ def cmd_postgres_check(args) -> int:
         print(f"  Run:  shelfard postgres snapshot --dsn ... {table_hint} --name {schema_name}")
         return 2
 
-    diff_result = compare_schemas_from_dicts(
+    diff_result = _registry.compare_with_baseline(
+        schema_name,
         baseline_result.data["schema"],
         new_result.data["schema"],
     )
@@ -387,7 +479,8 @@ def cmd_postgres_check(args) -> int:
         return 2
 
     return _finish_check(schema_name, diff_result.data["diff"], baseline_result.data,
-                         getattr(args, "update", False))
+                         getattr(args, "update", False),
+                         getattr(args, "allow_unaffected", False), getattr(args, "details", False))
 
 
 # ── File-format commands (Parquet / ORC / Avro) ───────────────────────────────
@@ -437,19 +530,19 @@ def cmd_file_snapshot(args) -> int:
     if schema.clustering_keys:
         print(f"  sorted by: {', '.join(schema.clustering_keys)}")
 
-    if getattr(args, "create_checker", False):
+    if getattr(args, "create_probe", False):
         env = _extract_env_vars(args.path)
         if args.source == "iceberg":
-            config = IcebergCheckerConfig(schema_name=schema_name, path=args.path, env=env)
+            config = IcebergProbeConfig(schema_name=schema_name, path=args.path, env=env)
         else:
-            config = FileCheckerConfig(
+            config = FileProbeConfig(
                 schema_name=schema_name, path=args.path, env=env, file_format=args.format,
             )
-        cr = register_checker(schema_name, config)
+        cr = register_probe(schema_name, config)
         if cr.success:
-            print(green(f"✓ Checker registered for '{schema_name}'") + f"  ({config.checker_type})")
+            print(green(f"✓ Probe registered for '{schema_name}'") + f"  ({config.probe_type})")
         else:
-            print(yellow(f"⚠ Snapshot saved but checker registration failed: {cr.error}"))
+            print(yellow(f"⚠ Snapshot saved but probe registration failed: {cr.error}"))
     return 0
 
 
@@ -465,7 +558,8 @@ def cmd_file_check(args) -> int:
         print(f"  Run:  shelfard {args.source} snapshot {args.path} --name {schema_name}")
         return 2
 
-    diff_result = compare_schemas_from_dicts(
+    diff_result = _registry.compare_with_baseline(
+        schema_name,
         baseline_result.data["schema"],
         new_result.data["schema"],
     )
@@ -474,7 +568,8 @@ def cmd_file_check(args) -> int:
         return 2
 
     return _finish_check(schema_name, diff_result.data["diff"], baseline_result.data,
-                         getattr(args, "update", False))
+                         getattr(args, "update", False),
+                         getattr(args, "allow_unaffected", False), getattr(args, "details", False))
 
 
 def cmd_file_list(args) -> int:
@@ -526,10 +621,10 @@ def cmd_show(args) -> int:
     print(bold(f"Schema: {args.table}") +
           f"  (source: {source} · version: {version} · {col_count} columns)")
 
-    checker_result = get_checker(args.table)
-    if checker_result.success:
-        c = checker_result.data["checker"]
-        print(f"Checker: {c['checker_type']}  (registered {c['registered_at']})")
+    probe_result = get_probe(args.table)
+    if probe_result.success:
+        c = probe_result.data["probe"]
+        print(f"Probe: {c['probe_type']}  (registered {c['registered_at']})")
 
     print()
     _print_schema(schema)
@@ -574,11 +669,13 @@ def cmd_list(args) -> int:
 
         print(f"\nConsumer subscriptions ({len(consumers)}):\n")
         for c in consumers:
-            cols = c.get("subscribed_columns")
-            cols_str = ", ".join(cols) if cols else "all columns"
+            cols_str = ", ".join(c.get("columns") or [])
+            if c.get("full"):
+                cols_str = f"all columns ({cols_str})"
+            state = _projection_state(c)
             print(
                 f"  {c['consumer']:<20} {c['source_table']:<14} "
-                f"{cols_str:<30} {c['subscribed_at']}"
+                f"{cols_str:<30} updated {c.get('updated_at')}{state}"
             )
         print()
 
@@ -587,37 +684,85 @@ def cmd_list(args) -> int:
 
 # ── subscribe command ─────────────────────────────────────────────────────────
 
-def cmd_subscribe(args) -> int:
-    columns = None
-    if args.columns:
-        columns = [c.strip() for c in args.columns.split(",") if c.strip()]
+def _projection_state(projection_dict: dict) -> str:
+    """'  · up to date' / '  · outdated (SAFE: a, b)' against the latest schema."""
+    from shelfard.models import ConsumerProjection
+    from shelfard.projection import consumer_diff
+    latest = get_registered_schema(projection_dict["source_table"])
+    if not latest.success:
+        return ""
+    d = consumer_diff(ConsumerProjection.from_dict(projection_dict),
+                      TableSchema.from_dict(latest.data["schema"]))
+    if not d["changes"]:
+        return "  · up to date"
+    sev = ChangeSeverity(d["overall_severity"])
+    names = ", ".join(c["column_name"] for c in d["changes"])
+    return "  · " + _sev_colour(sev, f"outdated ({sev.value}: {names})")
 
+
+def _split_columns(raw):
+    return [c.strip() for c in raw.split(",") if c.strip()] if raw else None
+
+
+def cmd_subscribe(args) -> int:
+    columns = _split_columns(args.columns)
     result = subscribe_consumer(args.consumer, args.table, columns)
     if not result.success:
         print(red(f"✗ {result.error}"))
         return 2
-
-    col_count = result.data["column_count"]
-    if columns:
-        cols_display = ", ".join(columns)
-        print(green(f"✓ Subscribed '{args.consumer}' to '{args.table}' — {col_count} columns: {cols_display}"))
-    else:
-        print(green(f"✓ Subscribed '{args.consumer}' to '{args.table}' — all {col_count} columns captured."))
-
-    if result.next_action_hint:
-        print(f"  Note: {result.next_action_hint}")
-
+    paths = result.data["projection"]["columns"]
+    scope = "all columns" if columns is None else "columns"
+    print(green(f"✓ '{args.consumer}' subscribed to '{args.table}' — {scope}: {', '.join(paths)}"))
+    print("  The expected shape of these columns is saved; future checks report the impact on them.")
     return 0
 
 
-# ── Checker commands ──────────────────────────────────────────────────────────
+def cmd_unsubscribe(args) -> int:
+    result = unsubscribe_consumer(args.consumer, args.table)
+    if not result.success:
+        print(red(f"✗ {result.error}"))
+        return 2
+    print(green(f"✓ '{args.consumer}' unsubscribed from '{args.table}'"))
+    return 0
 
-def cmd_checker_register(args) -> int:
-    checker_type = args.checker_type or "rest"
 
-    if checker_type == "rest":
+def cmd_consumer_refresh(args) -> int:
+    result = refresh_consumer(args.consumer, args.table)
+    if not result.success:
+        print(red(f"✗ {result.error}"))
+        return 2
+    adopted = result.data["adopted_changes"]
+    if not adopted:
+        print(green(f"✓ '{args.consumer}' projection on '{args.table}' was already up to date"))
+        return 0
+    print(green(f"✓ '{args.consumer}' adopted the current shape of '{args.table}':"))
+    for c in adopted:
+        print(f"    • {c['column_name']}: {c['reasoning']}")
+    return 0
+
+
+def cmd_consumers(args) -> int:
+    result = get_consumers_for_table(args.table)
+    if not result.success:
+        print(red(f"✗ {result.error}"))
+        return 2
+    consumers = result.data["consumers"]
+    print(f"\nConsumers of '{args.table}': {len(consumers)}\n")
+    for c in consumers:
+        cols = ", ".join(c["columns"])
+        print(f"  {c['consumer']:<20} {cols:<40}{_projection_state(c)}")
+    print()
+    return 0
+
+
+# ── Probe commands ──────────────────────────────────────────────────────────
+
+def cmd_probe_register(args) -> int:
+    probe_type = args.probe_type or "rest"
+
+    if probe_type == "rest":
         if not args.url:
-            print(red("✗ --url is required for rest checkers"))
+            print(red("✗ --url is required for rest probes"))
             return 2
         headers = []
         for item in args.header or []:
@@ -626,26 +771,26 @@ def cmd_checker_register(args) -> int:
                 continue
             k, _, v = item.partition("=")
             headers.append({k.strip(): v.strip()})
-        config = RestCheckerConfig(
+        config = RestProbeConfig(
             schema_name=args.schema_name,
             url=args.url,
             headers=headers,
             env=args.env or [],
         )
 
-    elif checker_type == "postgres":
+    elif probe_type == "postgres":
         if not args.dsn:
-            print(red("✗ --dsn is required for postgres checkers"))
+            print(red("✗ --dsn is required for postgres probes"))
             return 2
         if not args.table and not args.query:
-            print(red("✗ Either --table or --query is required for postgres checkers"))
+            print(red("✗ Either --table or --query is required for postgres probes"))
             return 2
         if args.table and args.query:
             print(red("✗ Provide either --table or --query, not both"))
             return 2
         if _query_template_rejected(args.query):
             return 2
-        config = PostgresCheckerConfig(
+        config = PostgresProbeConfig(
             schema_name=args.schema_name,
             dsn=args.dsn,
             env=args.env or [],
@@ -655,80 +800,81 @@ def cmd_checker_register(args) -> int:
             sample_size=args.sample_size or 100,
         )
 
-    elif checker_type == "file":
+    elif probe_type == "file":
         if not args.path:
-            print(red("✗ --path is required for file checkers"))
+            print(red("✗ --path is required for file probes"))
             return 2
-        config = FileCheckerConfig(
+        config = FileProbeConfig(
             schema_name=args.schema_name,
             path=args.path,
             env=args.env or _extract_env_vars(args.path),
             file_format=args.file_format or "auto",
         )
 
-    elif checker_type == "iceberg":
+    elif probe_type == "iceberg":
         if not args.path:
-            print(red("✗ --path is required for iceberg checkers"))
+            print(red("✗ --path is required for iceberg probes"))
             return 2
-        config = IcebergCheckerConfig(
+        config = IcebergProbeConfig(
             schema_name=args.schema_name,
             path=args.path,
             env=args.env or _extract_env_vars(args.path),
         )
 
     else:
-        print(red(f"✗ Unknown checker type: {checker_type!r}"))
+        print(red(f"✗ Unknown probe type: {probe_type!r}"))
         return 2
 
-    result = register_checker(args.schema_name, config)
+    result = register_probe(args.schema_name, config)
     if not result.success:
         print(red(f"✗ {result.error}"))
         return 2
 
     env_count = len(config.env)
     env_str = f"{env_count} env var{'s' if env_count != 1 else ''}"
-    print(green(f"✓ Checker registered for '{args.schema_name}'") +
-          f"  ({checker_type} · {env_str})")
+    print(green(f"✓ Probe registered for '{args.schema_name}'") +
+          f"  ({probe_type} · {env_str})")
     return 0
 
 
-def cmd_checker_run(args) -> int:
-    checker_result = get_checker(args.schema_name)
-    if not checker_result.success:
-        print(red(f"✗ {checker_result.error}"))
+def cmd_probe_run(args) -> int:
+    probe_result = get_probe(args.schema_name)
+    if not probe_result.success:
+        print(red(f"✗ {probe_result.error}"))
         return 2
 
-    c = checker_result.data["checker"]
-    if c.get("checker_type") == "postgres":
+    c = probe_result.data["probe"]
+    if c.get("probe_type") == "postgres":
         target = c.get("table") or "(custom query)"
         print(f"Checking PostgreSQL '{target}' …")
-    elif c.get("checker_type") in ("file", "iceberg"):
+    elif c.get("probe_type") in ("file", "iceberg"):
         print(f"Reading {c.get('path', '')} …")
     else:
         print(f"Fetching {c.get('url', '')} …")
 
-    result = run_checker(args.schema_name)
+    result = run_probe(args.schema_name)
     if not result.success:
         print(red(f"✗ {result.error}"))
         return 2
 
     baseline = {"version": result.data["baseline_version"],
                 "version_number": result.data.get("baseline_version_number")}
-    return _finish_check(args.schema_name, result.data["diff"], baseline, args.update)
+    return _finish_check(args.schema_name, result.data["diff"], baseline, args.update,
+                         getattr(args, "allow_unaffected", False), getattr(args, "details", False))
 
 
-def cmd_checker_show(args) -> int:
-    result = get_checker(args.schema_name)
+def cmd_probe_show(args) -> int:
+    result = get_probe(args.schema_name)
     if not result.success:
         print(red(f"✗ {result.error}"))
         return 2
 
-    c = result.data["checker"]
-    checker_type = c.get("checker_type", "rest")
-    print(f"\nChecker: {args.schema_name}")
-    print(f"  type:  {checker_type}")
+    c = result.data["probe"]
+    probe_type = c.get("probe_type", "rest")
+    print(f"\nProbe: {args.schema_name}")
+    print(f"  type:  {probe_type}")
 
-    if checker_type == "postgres":
+    if probe_type == "postgres":
         print(f"  dsn:   {c.get('dsn', '')}")
         if c.get("table"):
             print(f"  table: {c['table']}")
@@ -738,9 +884,9 @@ def cmd_checker_show(args) -> int:
             print(f"  schema: {c['db_schema']}")
         if c.get("env"):
             print(f"  env:   {', '.join(c['env'])}")
-    elif checker_type in ("file", "iceberg"):
+    elif probe_type in ("file", "iceberg"):
         print(f"  path:   {c.get('path', '')}")
-        if checker_type == "file":
+        if probe_type == "file":
             print(f"  format: {c.get('file_format', 'auto')}")
         if c.get("env"):
             print(f"  env:    {', '.join(c['env'])}")
@@ -758,23 +904,23 @@ def cmd_checker_show(args) -> int:
     return 0
 
 
-def cmd_checker_list(_args) -> int:
-    result = get_all_checkers()
+def cmd_probe_list(_args) -> int:
+    result = get_all_probes()
     if not result.success:
         print(red(f"✗ {result.error}"))
         return 2
 
-    checkers = result.data["checkers"]
-    if not checkers:
-        print("No checkers registered yet.")
+    probes = result.data["probes"]
+    if not probes:
+        print("No probes registered yet.")
         return 0
 
-    print(f"\nCheckers ({len(checkers)}):\n")
-    for c in checkers:
+    print(f"\nProbes ({len(probes)}):\n")
+    for c in probes:
         env_str = ", ".join(c["env"]) if c.get("env") else "—"
         target = c.get("url") or c.get("dsn") or c.get("path") or "—"
         print(
-            f"  {c['schema_name']:<20} {c['checker_type']:<8} "
+            f"  {c['schema_name']:<20} {c['probe_type']:<8} "
             f"{target:<45} {env_str:<20} {c.get('registered_at') or ''}"
         )
     print()
@@ -888,15 +1034,15 @@ def cmd_odcs_import(args) -> int:
 
 
 def cmd_odcs_check(args) -> int:
-    from shelfard.registry import fetch_checker_schema
+    from shelfard.registry import fetch_probe_schema
     from shelfard.schema_comparison import compare_schemas
 
     doc = _load_contract_or_report(args.contract)
     if doc is None:
         return 2
-    if args.checker:
-        label = args.checker
-        live = fetch_checker_schema(args.checker)
+    if args.probe:
+        label = args.probe
+        live = fetch_probe_schema(args.probe)
     else:
         label = args.name
         live = get_registered_schema(args.name)
@@ -921,8 +1067,16 @@ def cmd_odcs_check(args) -> int:
         print(red(f"✗ {result.error}"))
         return 2
     diff = result.data["diff"]
+    if args.name:          # a registered schema: show the impact on its consumers
+        impact = _registry.assess_consumer_impact(args.name, diff, contract_schema.to_dict(),
+                                                  live.data["schema"])
+        if impact.success:
+            diff = impact.data["diff"]
+            if (diff.get("suggested_update") or {}).get("kind") == "unaffected":
+                diff["suggested_update"] = None      # contracts take all-SAFE updates only
     version = doc.get("version", "?")
-    _print_diff(f"{label}' vs contract '{obj['name']}", diff, f"contract version {version}")
+    _print_diff(f"{label}' vs contract '{obj['name']}", diff, f"contract version {version}",
+                getattr(args, "details", False))
     if not diff["changes"]:
         return 0
 
@@ -989,8 +1143,8 @@ def _add_rest_subcommands(top) -> None:
         help="Fetch the endpoint and save its schema to the registry",
     )
     snap.add_argument(
-        "--create-checker", action="store_true", default=False,
-        help="Also register a checker config using the same URL and headers after snapshotting",
+        "--create-probe", action="store_true", default=False,
+        help="Also register a probe config using the same URL and headers after snapshotting",
     )
     snap.set_defaults(func=cmd_rest_snapshot)
 
@@ -1001,6 +1155,14 @@ def _add_rest_subcommands(top) -> None:
     chk.add_argument(
         "--update", action="store_true",
         help="If every change is SAFE, save the suggested schema as the next baseline version",
+    )
+    chk.add_argument(
+        "--allow-unaffected", action="store_true",
+        help="With --update: also accept WARNING/BREAKING changes that no consumer reads",
+    )
+    chk.add_argument(
+        "--details", action="store_true",
+        help="List the individual consumers affected (default: counts only)",
     )
     chk.set_defaults(func=cmd_rest_check)
 
@@ -1037,8 +1199,8 @@ def _add_postgres_subcommands(top) -> None:
         help="Read a PostgreSQL table or query and save its schema to the registry",
     )
     snap.add_argument(
-        "--create-checker", action="store_true", default=False,
-        help="Also register a checker config using the same DSN and table/query after snapshotting",
+        "--create-probe", action="store_true", default=False,
+        help="Also register a probe config using the same DSN and table/query after snapshotting",
     )
     snap.set_defaults(func=cmd_postgres_snapshot)
 
@@ -1049,6 +1211,14 @@ def _add_postgres_subcommands(top) -> None:
     chk.add_argument(
         "--update", action="store_true",
         help="If every change is SAFE, save the suggested schema as the next baseline version",
+    )
+    chk.add_argument(
+        "--allow-unaffected", action="store_true",
+        help="With --update: also accept WARNING/BREAKING changes that no consumer reads",
+    )
+    chk.add_argument(
+        "--details", action="store_true",
+        help="List the individual consumers affected (default: counts only)",
     )
     chk.set_defaults(func=cmd_postgres_check)
 
@@ -1081,8 +1251,8 @@ def _add_file_subcommands(top) -> None:
         help="Read a file's / table's schema and save it to the registry",
     )
     snap.add_argument(
-        "--create-checker", action="store_true", default=False,
-        help="Also register a checker config for the same path after snapshotting",
+        "--create-probe", action="store_true", default=False,
+        help="Also register a probe config for the same path after snapshotting",
     )
     snap.set_defaults(func=cmd_file_snapshot)
 
@@ -1093,6 +1263,14 @@ def _add_file_subcommands(top) -> None:
     chk.add_argument(
         "--update", action="store_true",
         help="If every change is SAFE, save the suggested schema as the next baseline version",
+    )
+    chk.add_argument(
+        "--allow-unaffected", action="store_true",
+        help="With --update: also accept WARNING/BREAKING changes that no consumer reads",
+    )
+    chk.add_argument(
+        "--details", action="store_true",
+        help="List the individual consumers affected (default: counts only)",
     )
     chk.set_defaults(func=cmd_file_check)
 
@@ -1122,8 +1300,8 @@ def _add_iceberg_subcommands(top) -> None:
         help="Read the table's current schema and save it to the registry",
     )
     snap.add_argument(
-        "--create-checker", action="store_true", default=False,
-        help="Also register a checker config for the same table path after snapshotting",
+        "--create-probe", action="store_true", default=False,
+        help="Also register a probe config for the same table path after snapshotting",
     )
     snap.set_defaults(func=cmd_file_snapshot)
 
@@ -1135,6 +1313,14 @@ def _add_iceberg_subcommands(top) -> None:
         "--update", action="store_true",
         help="If every change is SAFE, save the suggested schema as the next baseline version",
     )
+    chk.add_argument(
+        "--allow-unaffected", action="store_true",
+        help="With --update: also accept WARNING/BREAKING changes that no consumer reads",
+    )
+    chk.add_argument(
+        "--details", action="store_true",
+        help="List the individual consumers affected (default: counts only)",
+    )
     chk.set_defaults(func=cmd_file_check)
 
     lst = ice_cmds.add_parser("list", help="Find Iceberg tables under a warehouse directory")
@@ -1142,18 +1328,18 @@ def _add_iceberg_subcommands(top) -> None:
     lst.set_defaults(func=cmd_iceberg_list)
 
 
-def _add_checker_subcommands(top) -> None:
-    checker_p = top.add_parser("checker", help="Manage stored drift-check configurations")
-    checker_cmds = checker_p.add_subparsers(dest="command", required=True, metavar="COMMAND")
+def _add_probe_subcommands(top) -> None:
+    probe_p = top.add_parser("probe", help="Manage stored drift-check configurations")
+    probe_cmds = probe_p.add_subparsers(dest="command", required=True, metavar="COMMAND")
 
-    reg = checker_cmds.add_parser(
+    reg = probe_cmds.add_parser(
         "register",
-        help="Register a checker config for a schema",
+        help="Register a probe config for a schema",
     )
-    reg.add_argument("schema_name", help="Schema name to register a checker for")
+    reg.add_argument("schema_name", help="Schema name to register a probe for")
     reg.add_argument(
-        "--type", dest="checker_type", default="rest", choices=["rest", "postgres", "file", "iceberg"],
-        help="Checker type (default: rest)",
+        "--type", dest="probe_type", default="rest", choices=["rest", "postgres", "file", "iceberg"],
+        help="Probe type (default: rest)",
     )
     # REST options
     reg.add_argument("--url", default=None,
@@ -1184,22 +1370,30 @@ def _add_checker_subcommands(top) -> None:
         "--env", metavar="VAR", action="append", default=[],
         help="Env var name required at run time (repeatable)",
     )
-    reg.set_defaults(func=cmd_checker_register)
+    reg.set_defaults(func=cmd_probe_register)
 
-    run = checker_cmds.add_parser("run", help="Run the registered checker for a schema")
-    run.add_argument("schema_name", help="Schema name whose checker to run")
+    run = probe_cmds.add_parser("run", help="Run the registered probe for a schema")
+    run.add_argument("schema_name", help="Schema name whose probe to run")
     run.add_argument(
         "--update", action="store_true",
         help="If every change is SAFE, save the suggested schema as the next baseline version",
     )
-    run.set_defaults(func=cmd_checker_run)
+    run.add_argument(
+        "--allow-unaffected", action="store_true",
+        help="With --update: also accept WARNING/BREAKING changes that no consumer reads",
+    )
+    run.add_argument(
+        "--details", action="store_true",
+        help="List the individual consumers affected (default: counts only)",
+    )
+    run.set_defaults(func=cmd_probe_run)
 
-    show = checker_cmds.add_parser("show", help="Display the registered checker config")
-    show.add_argument("schema_name", help="Schema name whose checker to show")
-    show.set_defaults(func=cmd_checker_show)
+    show = probe_cmds.add_parser("show", help="Display the registered probe config")
+    show.add_argument("schema_name", help="Schema name whose probe to show")
+    show.set_defaults(func=cmd_probe_show)
 
-    lst = checker_cmds.add_parser("list", help="List all registered checkers")
-    lst.set_defaults(func=cmd_checker_list)
+    lst = probe_cmds.add_parser("list", help="List all registered probes")
+    lst.set_defaults(func=cmd_probe_list)
 
 
 def _add_var_subcommands(top) -> None:
@@ -1245,12 +1439,14 @@ def _add_odcs_subcommands(top) -> None:
     chk = odcs_cmds.add_parser("check", help="Compare a live or registered schema with a contract")
     chk.add_argument("contract", help="Contract file (.json, .yaml, .yml)")
     src = chk.add_mutually_exclusive_group(required=True)
-    src.add_argument("--checker", metavar="NAME", help="Read the live schema with this stored checker")
+    src.add_argument("--probe", metavar="NAME", help="Read the live schema with this stored probe")
     src.add_argument("--name", metavar="NAME", help="Use the latest registered version of this schema")
     chk.add_argument("--object", metavar="OBJ",
                      help="Schema object in the contract (default: the only one, or the one named like the source)")
     chk.add_argument("--update", action="store_true",
                      help="When every change is SAFE, write them into the contract (bumps the patch version)")
+    chk.add_argument("--details", action="store_true",
+                     help="With --name: list the individual consumers affected (default: counts only)")
     chk.set_defaults(func=cmd_odcs_check)
 
 
@@ -1275,7 +1471,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_postgres_subcommands(top)
     _add_file_subcommands(top)
     _add_iceberg_subcommands(top)
-    _add_checker_subcommands(top)
+    _add_probe_subcommands(top)
     _add_var_subcommands(top)
     _add_odcs_subcommands(top)
 
@@ -1295,7 +1491,7 @@ def build_parser() -> argparse.ArgumentParser:
     agent_p.add_argument(
         "--allow-writes", action="store_true",
         help=(
-            "Let the agent register checkers and modify template variables "
+            "Let the agent register probes and modify template variables "
             "(off by default; write tools are guarded but still risky with untrusted data)."
         ),
     )
@@ -1308,7 +1504,7 @@ def build_parser() -> argparse.ArgumentParser:
     mcp_p.add_argument(
         "--allow-writes", action="store_true",
         help=(
-            "Expose register_checker / set_template_var / delete_template_var "
+            "Expose register_probe / set_template_var / delete_template_var "
             "(or set SHELFARD_MCP_ALLOW_WRITES=1). Off by default."
         ),
     )
@@ -1326,7 +1522,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     list_p.set_defaults(func=cmd_list)
 
-    sub_p = top.add_parser("subscribe", help="Subscribe a consumer to a registered schema")
+    sub_p = top.add_parser("subscribe", help="Save a consumer's projection of a registered schema")
     sub_p.add_argument("table", help="Source schema name")
     sub_p.add_argument(
         "--consumer", metavar="NAME", required=True,
@@ -1334,9 +1530,26 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sub_p.add_argument(
         "--columns", metavar="COL1,COL2,...",
-        help="Comma-separated columns to subscribe to (default: all columns)",
+        help="Comma-separated column paths, e.g. id,address.zip,tags[] (default: all top-level columns)",
     )
     sub_p.set_defaults(func=cmd_subscribe)
+
+    unsub_p = top.add_parser("unsubscribe", help="Remove a consumer's projection")
+    unsub_p.add_argument("table", help="Source schema name")
+    unsub_p.add_argument("--consumer", metavar="NAME", required=True, help="Consumer name")
+    unsub_p.set_defaults(func=cmd_unsubscribe)
+
+    cons_p = top.add_parser("consumers", help="List a schema's consumers and whether their projections are current")
+    cons_p.add_argument("table", help="Source schema name")
+    cons_p.set_defaults(func=cmd_consumers)
+
+    consumer_p = top.add_parser("consumer", help="Consumer-side actions")
+    consumer_cmds = consumer_p.add_subparsers(dest="command", required=True, metavar="COMMAND")
+    ref = consumer_cmds.add_parser(
+        "refresh", help="Adopt the latest schema shape for the columns this consumer reads")
+    ref.add_argument("table", help="Source schema name")
+    ref.add_argument("--consumer", metavar="NAME", required=True, help="Consumer name")
+    ref.set_defaults(func=cmd_consumer_refresh)
 
     return parser
 

@@ -1,7 +1,7 @@
 """
-File-format drift checker (Parquet / ORC / Avro).
+File-format drift probe (Parquet / ORC / Avro).
 
-Loads a stored :class:`~shelfard.models.FileCheckerConfig`, resolves
+Loads a stored :class:`~shelfard.models.FileProbeConfig`, resolves
 ``{{template_vars}}`` and then ``$ENV_VARS`` in the path at run time, reads the
 current schema with :class:`~shelfard.tools.files.reader.FileReader`, and diffs
 it against the registered baseline.
@@ -9,14 +9,14 @@ it against the registered baseline.
 
 import os
 
-from ..base import Checker
-from ...models import FileCheckerConfig, ToolResult
+from ..base import Probe
+from ...models import FileProbeConfig, ToolResult
 
 
-class FileChecker(Checker):
+class FileProbe(Probe):
     """Run a stored file-format drift-check configuration."""
 
-    def __init__(self, config: FileCheckerConfig, registry) -> None:
+    def __init__(self, config: FileProbeConfig, registry) -> None:
         self.config = config
         self.registry = registry
 
@@ -54,9 +54,10 @@ class FileChecker(Checker):
                 next_action_hint="Run 'shelfard file snapshot' first to capture a baseline",
             )
 
-        from ...schema_comparison import compare_schemas_from_dicts
+        from ..base import compare_against_baseline
 
-        diff = compare_schemas_from_dicts(baseline.data["schema"], live.data["schema"])
+        diff = compare_against_baseline(self.registry, self.config.schema_name,
+                                        baseline.data["schema"], live.data["schema"])
         if not diff.success:
             return ToolResult(success=False, error=diff.error)
 

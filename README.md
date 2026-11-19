@@ -63,17 +63,17 @@ Fetching https://api.example.com/users/1 …
 ✓ Snapshot saved: 'users' (version 1, 6 top-level columns)
 ```
 
-Add `--create-checker` to register a checker config in the same command — no separate `checker register` step needed. `$VAR_NAME` references in the URL and headers are extracted automatically into the `env` list:
+Add `--create-probe` to register a probe config in the same command — no separate `probe register` step needed. `$VAR_NAME` references in the URL and headers are extracted automatically into the `env` list:
 
 ```bash
 shelfard rest snapshot https://api.example.com/users/1 --name users \
   --header 'Authorization=Bearer $BEARER_TOKEN' \
-  --create-checker
+  --create-probe
 ```
 
 ```
 ✓ Snapshot saved: 'users' (version 1, 6 top-level columns)
-✓ Checker registered for 'users'  (rest · 1 env var)
+✓ Probe registered for 'users'  (rest · 1 env var)
 ```
 
 ### 2. Check — detect drift
@@ -107,7 +107,7 @@ Fetching https://api.example.com/users/1 …
 
 **Only safe changes — update suggested:**
 
-When every change is SAFE, the check explains what a new baseline would record and offers to save it. Add `--update` (works on every `check` command and on `checker run`) to register it as the next version:
+When every change is SAFE, the check explains what a new baseline would record and offers to save it. Add `--update` (works on every `check` command and on `probe run`) to register it as the next version:
 
 ```
 $ shelfard rest check https://api.example.com/users/1 --name users
@@ -131,7 +131,7 @@ $ shelfard rest check https://api.example.com/users/1 --name users --update
 ✓ Baseline updated: 'users' is now version 2
 ```
 
-`--update` never applies WARNING or BREAKING drift — review those and re-snapshot to accept them. The update is refused if someone re-snapshotted since the check ran.
+`--update` alone never applies WARNING or BREAKING drift. When those changes touch no consumer, `--update --allow-unaffected` accepts them (see [Consumers](#cli--consumers-and-projections)); otherwise review them and re-snapshot. The update is refused if someone re-snapshotted since the check ran.
 
 **Physical types and constraints.** Besides the normalized type, every reader records the source's own type (`physical_type`: `timestamp with time zone`, `int64`, `decimal(10, 2)`, the JSON type for REST payloads). Where the source can tell, it also records constraints: primary keys and single-column UNIQUE for PostgreSQL tables and SQLite, Iceberg identifier fields, and `format: uuid`. A different physical type with the same normalized type (e.g. `timestamptz` → `timestamp`) is a WARNING, and so is any constraint change (primary key removed, unique added, …). Each is compared only when both versions know it, so baselines saved before these fields existed report no extra drift.
 
@@ -191,19 +191,19 @@ Reading PostgreSQL 'orders' …
 ✓ Snapshot saved: 'orders' (version 1, 7 top-level columns)
 ```
 
-Add `--create-checker` to register a checker in the same step. `$VAR_NAME` references in the DSN are extracted automatically:
+Add `--create-probe` to register a probe in the same step. `$VAR_NAME` references in the DSN are extracted automatically:
 
 ```bash
 shelfard postgres snapshot \
   --dsn 'postgresql://user:$PG_PASS@host/db' \
   --table orders --name orders \
-  --create-checker
+  --create-probe
 ```
 
 ```
 Reading PostgreSQL 'orders' …
 ✓ Snapshot saved: 'orders' (version 1, 7 top-level columns)
-✓ Checker registered for 'orders'  (postgres · 1 env var)
+✓ Probe registered for 'orders'  (postgres · 1 env var)
 ```
 
 ### Custom SQL query mode
@@ -277,8 +277,8 @@ Paths may use `{{var}}` template variables and `$ENV_VARS`. Remote URIs
 
 ```bash
 shelfard var set lake /mnt/lake
-shelfard file snapshot '{{lake}}/orders' --name orders --create-checker
-shelfard checker run orders
+shelfard file snapshot '{{lake}}/orders' --name orders --create-probe
+shelfard probe run orders
 ```
 
 ---
@@ -291,7 +291,7 @@ dependency.
 
 ```bash
 shelfard iceberg list     warehouse/                         # → db.orders, db.users, ...
-shelfard iceberg snapshot warehouse/db/orders --name orders  # --create-checker works too
+shelfard iceberg snapshot warehouse/db/orders --name orders  # --create-probe works too
 shelfard iceberg check    warehouse/db/orders --name orders  # exit 1 on drift
 
 # Baseline from an older commit, then compare against the current one
@@ -323,7 +323,7 @@ shelfard iceberg check    sample_data/warehouse/db/orders --name orders_ice
 
 ### Show a schema
 
-Display the full column layout of a registered schema, with type, nullability, and nested STRUCT fields. If a checker is registered for the schema, its type and registration time are shown:
+Display the full column layout of a registered schema, with type, nullability, and nested STRUCT fields. If a probe is registered for the schema, its type and registration time are shown:
 
 ```bash
 shelfard show <name>
@@ -333,7 +333,7 @@ shelfard show <name>
 $ shelfard show users
 
 Schema: users  (source: rest_api · version: 2026-02-28T12:00:00 · 5 columns)
-Checker: rest  (registered 2026-03-01T10:00:00)
+Probe: rest  (registered 2026-03-01T10:00:00)
 
   id                       INTEGER      NOT NULL
   email                    VARCHAR      NOT NULL   (max 255)
@@ -364,117 +364,143 @@ shelfard list subscriptions
 ```
 
 ```
-Consumer subscriptions (3):
+Consumer subscriptions (2):
 
-  analytics            users          all columns                    2026-02-28T12:00:00
-  email_svc            users          email, created_at              2026-02-28T14:00:00
-  reporting            orders         all columns                    2026-02-28T16:00:00
+  blog                 posts          all columns (userId, id, title, body) updated 2026-03-01T18:48:08  · up to date
+  report               orders         order_id, quantity             updated 2026-11-18T20:34:01  · outdated (SAFE: quantity)
 ```
 
 ---
 
-## CLI — Consumer subscriptions
+## CLI — Consumers and projections
 
-Register which schemas (and columns) a consumer depends on directly from the terminal.
-
-### Full subscription
+A consumer subscribes to a **projection** of a schema: the columns it reads, with the shape it expects for them. Projections aren't versioned; they always refer to the schema's latest registered version. Every check reports the impact on each consumer.
 
 ```bash
-shelfard subscribe users --consumer analytics
+# Column paths: top-level columns, nested fields, array items
+shelfard subscribe orders --consumer report --columns order_id,quantity
+shelfard subscribe orders --consumer crm --columns customer.email      # also: 'tags[]', 'tags[].sku'
+shelfard subscribe orders --consumer audit                             # all top-level columns
+
+shelfard consumers orders                              # who reads what; is each projection current?
+shelfard unsubscribe orders --consumer crm
+shelfard consumer refresh orders --consumer report     # adopt the current shape (consumer's own action)
 ```
 
-```
-✓ Subscribed 'analytics' to 'users' — all 5 columns captured.
-```
-
-### Projection
-
-```bash
-shelfard subscribe users --consumer email_svc --columns email,created_at
-```
+**Consumer impact in every check.** Each change is labelled `no consumers` or `consumer constrained (N)`. Each consumer is judged by its own diff (expected shape vs. the new schema), so it gets its own severity: `int → bigint` on a column it reads is SAFE for it, and removing a column it doesn't read doesn't concern it. The check ends with the number of affected consumers out of the total. Only counts are shown, since a schema may have hundreds of consumers; add `--details` (any `check`, `probe run`, or `odcs check --name`) to list them, or use `shelfard consumers <table>`:
 
 ```
-✓ Subscribed 'email_svc' to 'users' — 2 columns: email, created_at
+$ shelfard probe run orders
+✗ Schema drift detected for 'orders'
+  4 change(s) detected: 2 breaking, 2 safe.
+
+  [BREAKING · no consumers]             column_removed            'status'
+  [SAFE · no consumers]                 column_added              'discount'
+  [BREAKING · consumer constrained (1)] column_removed            'customer.email'
+  [SAFE · consumer constrained (1)]     type_widened              'quantity'
+
+  Consumers: 2 of 2 affected — 1 BREAKING, 1 SAFE
+  Run with --details to list them, or 'shelfard consumers orders'.
 ```
 
-The subscription records a snapshot of the relevant columns at the time of the command. Run `shelfard list subscriptions` to see all registered consumers.
+With `--details`, each constrained change gets a `Consumers: crm BREAKING` line and the summary lists every affected consumer with its severity and the columns involved.
+
+**Breaking changes nobody reads can be accepted.** If every WARNING/BREAKING change has `no consumers`, the check suggests a baseline update (kind `unaffected`) — this also applies to schemas without any consumers ("0 of 0"). Because it accepts breaking changes, it needs an explicit flag:
+
+```
+$ shelfard probe run orders --update --allow-unaffected
+  …
+  Suggested baseline update (version 1 → 2):
+    • remove 'status' — BREAKING, no consumer reads it
+    • add 'discount' (float)
+    • remove 'customer.email' — BREAKING, no consumer reads it
+    • widen 'quantity' from integer to bigint
+  Contains 2 WARNING/BREAKING change(s) that no consumer reads.
+✓ Baseline updated: 'orders' is now version 2
+  Consumer projections are unchanged; 1 now differs from the baseline (1 SAFE). Consumers can refresh with 'shelfard consumer refresh orders --consumer NAME'.
+  Run with --details to list them, or 'shelfard consumers orders'.
+```
+
+`--update` alone still applies only all-SAFE updates. Right before saving, Shelfard checks the consumers again, so a consumer that subscribed to a removed column after the check blocks the update.
+
+**Projections belong to their consumers.** Baseline updates never change them: consumers are often other teams. Instead, checks report `Outdated projections: 1 (1 SAFE)` (names with `--details`) until the consumer runs `shelfard consumer refresh`. Refreshing fails if a column they read no longer exists; they then re-subscribe with the columns they read now.
 
 ---
 
-## CLI — Checker (stored drift-check configs)
+## CLI — Probe (stored drift-check configs)
 
-Register a check configuration once, then run it any time — from the CLI, from code, or via the MCP server — without repeating the URL, DSN, or auth details. Two checker types are supported: `rest` (default) and `postgres`.
+Register a check configuration once, then run it any time — from the CLI, from code, or via the MCP server — without repeating the URL, DSN, or auth details. Two probe types are supported: `rest` (default) and `postgres`.
 
-The easiest way is `--create-checker` on a snapshot command (see above) — it builds the checker from the same arguments automatically. Use `checker register` when you need to register or update a checker independently.
+The easiest way is `--create-probe` on a snapshot command (see above) — it builds the probe from the same arguments automatically. Use `probe register` when you need to register or update a probe independently.
 
-### REST checker
+### REST probe
 
 ```bash
-shelfard checker register users --url https://api.example.com/users/1
-✓ Checker registered for 'users'  (rest · 0 env vars)
+shelfard probe register users --url https://api.example.com/users/1
+✓ Probe registered for 'users'  (rest · 0 env vars)
 ```
 
 With authentication (env var names stored, values resolved at run time):
 
 ```bash
-shelfard checker register users \
+shelfard probe register users \
   --url 'https://api.example.com/users/1' \
   --header 'Authorization=$BEARER_TOKEN' \
   --env BEARER_TOKEN
 ```
 
-### PostgreSQL checker — table mode
+### PostgreSQL probe — table mode
 
 ```bash
-shelfard checker register orders \
+shelfard probe register orders \
   --type postgres \
   --dsn 'postgresql://user:$PG_PASS@host/db' \
   --table orders \
   --env PG_PASS
-✓ Checker registered for 'orders'  (postgres · 1 env var)
+✓ Probe registered for 'orders'  (postgres · 1 env var)
 ```
 
-### PostgreSQL checker — query mode
+### PostgreSQL probe — query mode
 
 Track the schema of a derived result set. Nullability is re-sampled from live data on every run:
 
 ```bash
-shelfard checker register order_summary \
+shelfard probe register order_summary \
   --type postgres \
   --dsn 'postgresql://user:$PG_PASS@host/db' \
   --query 'SELECT o.id, o.total, u.email FROM orders o JOIN users u ON o.user_id = u.id' \
   --env PG_PASS
 ```
 
-### File and Iceberg checkers
+### File and Iceberg probes
 
 ```bash
-shelfard checker register events --type file --path '{{lake}}/events' --format avro
-shelfard checker register orders --type iceberg --path '{{lake}}/warehouse/db/orders'
+shelfard probe register events --type file --path '{{lake}}/events' --format avro
+shelfard probe register orders --type iceberg --path '{{lake}}/warehouse/db/orders'
 ```
 
-### Run a checker
+### Run a probe
 
 ```bash
-shelfard checker run <name>
+shelfard probe run <name>
 ```
 
 ```
-$ shelfard checker run orders
+$ shelfard probe run orders
 Checking PostgreSQL 'orders' …
 ✓ No drift detected for 'orders'  (last snapshot: 2026-03-01T10:00:00)
 ```
 
 Drift output follows the same format as `shelfard postgres check`. Exit code `1` on drift makes this suitable for CI.
 
-### Show and list checkers
+### Show and list probes
 
 ```bash
-shelfard checker show orders
+shelfard probe show orders
 ```
 
 ```
-Checker: orders
+Probe: orders
   type:  postgres
   dsn:   postgresql://user:$PG_PASS@host/db
   table: orders
@@ -482,11 +508,11 @@ Checker: orders
 ```
 
 ```bash
-shelfard checker list
+shelfard probe list
 ```
 
 ```
-Checkers (3):
+Probes (3):
 
   users          rest     https://api.example.com/users/1          BEARER_TOKEN   2026-03-01T...
   orders         postgres postgresql://user:$PG_PASS@host/db       PG_PASS        2026-03-01T...
@@ -506,8 +532,8 @@ shelfard odcs export orders --out orders.odcs.yaml
 # Register every schema object of a contract (prints the ODCS fields Shelfard can't represent)
 shelfard odcs import orders.odcs.yaml --name-prefix contract_
 
-# Compare a live source (through a stored checker) or a registered schema with a contract
-shelfard odcs check orders.odcs.yaml --checker orders
+# Compare a live source (through a stored probe) or a registered schema with a contract
+shelfard odcs check orders.odcs.yaml --probe orders
 shelfard odcs check orders.odcs.yaml --name orders --object orders --update
 ```
 
@@ -521,7 +547,7 @@ shelfard odcs check orders.odcs.yaml --name orders --object orders --update
 
 ## CLI — Template variables
 
-Store repeated non-sensitive config values (hosts, base URLs, ports) once and reference them as `{{var_name}}` in checker configs and snapshot commands. This is distinct from `$ENV_VAR` — template variables are stored in the registry and are not secrets.
+Store repeated non-sensitive config values (hosts, base URLs, ports) once and reference them as `{{var_name}}` in probe configs and snapshot commands. This is distinct from `$ENV_VAR` — template variables are stored in the registry and are not secrets.
 
 ### Set and use a variable
 
@@ -539,9 +565,9 @@ Now use it anywhere a URL or DSN would appear:
 # Snapshot only
 shelfard rest snapshot "{{todo_host}}/api/v1" --name todo_api
 
-# Snapshot + checker in one step (--create-checker extracts $VAR refs automatically)
-shelfard rest snapshot "{{todo_host}}/api/v1" --name todo_api --create-checker
-shelfard postgres snapshot --dsn "postgresql://user:pass@{{db_host}}/mydb" --table orders --name orders --create-checker
+# Snapshot + probe in one step (--create-probe extracts $VAR refs automatically)
+shelfard rest snapshot "{{todo_host}}/api/v1" --name todo_api --create-probe
+shelfard postgres snapshot --dsn "postgresql://user:pass@{{db_host}}/mydb" --table orders --name orders --create-probe
 ```
 
 Template variables are resolved **before** `$ENV_VAR` substitution, so they can be combined:
@@ -550,7 +576,7 @@ Template variables are resolved **before** `$ENV_VAR` substitution, so they can 
 shelfard var set api_base https://api.example.com
 shelfard rest snapshot "{{api_base}}/users/1" --name users \
   --header "Authorization=$BEARER_TOKEN" \
-  --create-checker
+  --create-probe
 ```
 
 ### Manage variables
@@ -631,7 +657,7 @@ The model **must support tool calling** (e.g. `qwen2.5`, `qwen3`, `llama3.1`/`3.
 
 ### Read-only by default
 
-The agent starts in **read-only** mode: it can inspect schemas, subscriptions, checkers, and template variables, and run live checks on existing checkers. To let it register checkers and modify template variables, pass `--allow-writes`:
+The agent starts in **read-only** mode: it can inspect schemas, subscriptions, probes, and template variables, and run live checks on existing probes. To let it register probes and modify template variables, pass `--allow-writes`:
 
 ```bash
 shelfard agent --allow-writes
@@ -648,7 +674,7 @@ In write mode, **every write tool call stops for your approval** before it runs:
 
 Anything other than `y` rejects the call and tells the model not to retry. The [MCP security](#security) guards apply as well.
 
-**Environment passed to the tools.** The agent's MCP subprocess receives `SHELFARD_*` env vars, names listed in `SHELFARD_MCP_ENV_ALLOWLIST`, and the env vars declared by checkers **you registered from the CLI** (so `live_check_schema` works for a checker using `$BEARER_TOKEN`). LLM API keys (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, …) are never passed to it.
+**Environment passed to the tools.** The agent's MCP subprocess receives `SHELFARD_*` env vars, names listed in `SHELFARD_MCP_ENV_ALLOWLIST`, and the env vars declared by probes **you registered from the CLI** (so `live_check_schema` works for a probe using `$BEARER_TOKEN`). LLM API keys (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, …) are never passed to it.
 
 **Long sessions.** Older turns are summarized automatically once the conversation grows large (scaled to `OLLAMA_NUM_CTX` for local models), keeping the most recent messages verbatim. Type `/reset` to start a fresh conversation.
 
@@ -673,7 +699,7 @@ Agent: The posts schema has 4 columns:
 You: exit
 ```
 
-The agent has access to the Shelfard MCP read tools — `get_schemas`, `get_schema` (includes checker info), `get_subscriptions`, `get_subscription`, `get_checker_config`, `live_check_schema`, `get_schema_odcs`, `get_template_var`, `list_template_vars` — plus, with `--allow-writes`, `register_checker`, `register_postgres_checker`, `set_template_var`, `delete_template_var`, and `accept_safe_schema_update`.
+The agent has access to the Shelfard MCP read tools — `get_schemas`, `get_schema` (includes probe info), `get_subscriptions`, `get_subscription`, `get_probe_config`, `live_check_schema`, `get_schema_odcs`, `get_template_var`, `list_template_vars` — plus, with `--allow-writes`, `register_probe`, `register_postgres_probe`, `set_template_var`, `delete_template_var`, and `accept_schema_update`.
 
 ---
 
@@ -693,16 +719,16 @@ The server runs over **stdio** (the MCP standard for local tools). It exposes ei
 | Tool | Description |
 |---|---|
 | `get_schemas` | List all registered schemas with summary info |
-| `get_schema(schema_name)` | Retrieve a specific schema with full column detail; includes checker info if registered |
+| `get_schema(schema_name)` | Retrieve a specific schema with full column detail; includes probe info if registered |
 | `get_subscriptions` | List all consumer subscriptions |
 | `get_subscription(consumer_name, table_name)` | Retrieve a specific consumer subscription |
-| ✎ `register_checker(schema_name, url, env, headers)` | Register a **new** REST checker config for a schema (see [Security](#security)) |
-| ✎ `register_postgres_checker(schema_name, dsn, table, db_schema, env)` | Register a **new** PostgreSQL checker (table mode only — no custom SQL) |
-| `get_checker_config(schema_name)` | Retrieve the stored checker config (url, env vars, headers) |
-| `live_check_schema(schema_name)` | Run the registered checker against the live endpoint and return the drift result (with `suggested_update` when every change is SAFE) |
+| ✎ `register_probe(schema_name, url, env, headers)` | Register a **new** REST probe config for a schema (see [Security](#security)) |
+| ✎ `register_postgres_probe(schema_name, dsn, table, db_schema, env)` | Register a **new** PostgreSQL probe (table mode only — no custom SQL) |
+| `get_probe_config(schema_name)` | Retrieve the stored probe config (url, env vars, headers) |
+| `live_check_schema(schema_name)` | Run the registered probe against the live endpoint and return the drift result (with `suggested_update` when every change is SAFE) |
 | `get_schema_odcs(schema_name, version?)` | Export a registered schema as an ODCS v3.1.0 contract (semver from the history). Export only — contracts are imported and written from the CLI |
-| ✎ `accept_safe_schema_update(schema_name)` | Re-run the checker and, only if every change is SAFE, save the suggested schema as the next baseline version |
-| ✎ `set_template_var(name, value)` | Store a named template variable for use as `{{name}}` in checker configs and snapshot commands |
+| ✎ `accept_schema_update(schema_name, allow_unaffected=False)` | Re-run the probe and save the suggested schema as the next baseline version — only if every change is SAFE, or (with `allow_unaffected`) if every WARNING/BREAKING change touches no consumer. Never changes consumer projections |
+| ✎ `set_template_var(name, value)` | Store a named template variable for use as `{{name}}` in probe configs and snapshot commands |
 | `get_template_var(name)` | Retrieve a stored template variable by name |
 | `list_template_vars()` | List all stored template variables and their values |
 | ✎ `delete_template_var(name)` | Delete a stored template variable by name |
@@ -732,16 +758,16 @@ Point your MCP client at `shelfard mcp` with stdio transport. The server reads f
 
 MCP tool inputs come from an LLM, and the LLM reads data that third parties control (field names returned by a REST API, for example). A prompt injection could otherwise trick it into sending your secrets to an attacker's URL, or writing files outside the registry. The server therefore treats every tool input as untrusted:
 
-- **Write tools are off by default.** `register_checker`, `register_postgres_checker`, `set_template_var`, `delete_template_var`, and `accept_safe_schema_update` are only exposed with `--allow-writes`. In `shelfard agent`, each write call also needs your interactive approval.
-- **Env-var allowlist.** Checkers registered via MCP may only reference env vars prefixed with `SHELFARD_` or listed in `SHELFARD_MCP_ENV_ALLOWLIST` (comma-separated). `$ANTHROPIC_API_KEY`, `$AWS_SECRET_ACCESS_KEY`, etc. are rejected. Every `$VAR` in the URL/headers/DSN must be declared in `env`.
-- **Internal-address (SSRF) guard.** Checkers registered via MCP must target public hosts — loopback, private, link-local (e.g. `169.254.169.254` cloud metadata), and reserved ranges are rejected. This is checked at registration **and again every time the checker runs**:
+- **Write tools are off by default.** `register_probe`, `register_postgres_probe`, `set_template_var`, `delete_template_var`, and `accept_schema_update` are only exposed with `--allow-writes`. In `shelfard agent`, each write call also needs your interactive approval.
+- **Env-var allowlist.** Probes registered via MCP may only reference env vars prefixed with `SHELFARD_` or listed in `SHELFARD_MCP_ENV_ALLOWLIST` (comma-separated). `$ANTHROPIC_API_KEY`, `$AWS_SECRET_ACCESS_KEY`, etc. are rejected. Every `$VAR` in the URL/headers/DSN must be declared in `env`.
+- **Internal-address (SSRF) guard.** Probes registered via MCP must target public hosts — loopback, private, link-local (e.g. `169.254.169.254` cloud metadata), and reserved ranges are rejected. This is checked at registration **and again every time the probe runs**:
   - REST: the address of every TCP connection is verified on the connected socket, including each redirect hop, so DNS rebinding (a name that resolves somewhere else later) is caught.
   - PostgreSQL: the host is re-resolved and validated, and the connection is pinned to that IP via libpq `hostaddr`. Multi-host and Unix-socket DSNs are rejected. Only table mode is allowed (no custom SQL).
   - Set `SHELFARD_MCP_ALLOW_PRIVATE_HOSTS=1` for local development.
-- **No tampering with existing checkers.** MCP cannot overwrite an existing checker, and cannot change or delete a template variable that a registered checker references.
-- **Path-traversal guard.** Schema, table, consumer, and checker names must match `[A-Za-z0-9_][A-Za-z0-9_.-]*` (no `/`, no `..`) — enforced in the registry for every entry point, CLI included.
+- **No tampering with existing probes.** MCP cannot overwrite an existing probe, and cannot change or delete a template variable that a registered probe references.
+- **Path-traversal guard.** Schema, table, consumer, and probe names must match `[A-Za-z0-9_][A-Za-z0-9_.-]*` (no `/`, no `..`) — enforced in the registry for every entry point, CLI included.
 
-Checkers you register yourself with the CLI are trusted and not subject to the MCP allowlist or host restrictions. Checkers store how they were registered (`registered_via: "cli" | "mcp"`).
+Probes you register yourself with the CLI are trusted and not subject to the MCP allowlist or host restrictions. Probes store how they were registered (`registered_via: "cli" | "mcp"`).
 
 **Applies to every REST fetch** (CLI or MCP): redirects are followed manually (max 5). On a redirect to a different origin, all custom headers are dropped, so secrets in headers like `X-API-Key` never reach another host. Redirects to non-HTTP(S) URLs are refused.
 
@@ -796,36 +822,33 @@ Change classification is fully deterministic — no LLM involved for clear-cut c
 | `WARNING` | Column reordered, default value changed, physical type changed (same normalized type), constraint changed (primary key, unique, …) |
 | `BREAKING` | Column removed, type narrowed, `NOT NULL` column added without a default |
 
+Each change is also labelled with its consumer impact (`no consumers` / `consumer constrained`), and each consumer gets its own severity based on the columns it reads.
+
 ---
 
-## Consumer subscriptions (Python API)
-
-Register consumers and the columns they depend on. When a source schema drifts, Shelfard tells you exactly which consumers are impacted.
+## Consumer projections (Python API)
 
 ```python
 from shelfard import LocalFileRegistry
 
 r = LocalFileRegistry()
+r.subscribe_consumer("email_service", "users", columns=["email", "address.zip"])
+r.subscribe_consumer("reporting_service", "users")          # all top-level columns
 
-# Full subscription — consumer depends on the entire schema
-r.subscribe_consumer("reporting_service", "users")
+# Diff with consumer impact (what probes and check commands use)
+result = r.compare_with_baseline("users", baseline_schema_dict, live_schema_dict)
+diff = result.data["diff"]
+for change in diff["changes"]:
+    print(change["column_name"], change["severity"], change["consumer_impact"], change["consumers"])
+print(diff["consumer_summary"])     # {"total": 2, "affected": 1, "by_severity": {...}, "outdated": [...]}
 
-# Projection — consumer only reads these two columns
-r.subscribe_consumer("email_service", "users", columns=["email", "created_at"])
+# Accept a suggested update ("unaffected" kind needs allow_unaffected=True)
+r.accept_update("users", diff, baseline_version, allow_unaffected=True)
 
-# After detecting drift, find out who is affected
-from shelfard import compare_schemas, get_registered_schema
-from shelfard.models import SchemaDiff
-
-diff_result = compare_schemas(old_schema, new_schema)
-diff = SchemaDiff(**diff_result.data["diff"])  # reconstruct from dict if needed
-
-impact = r.get_consumers_affected_by_diff("users", diff)
-for entry in impact.data["affected"]:
-    print(entry["consumer"], "→", [c["column_name"] for c in entry["impacted_changes"]])
+r.refresh_consumer("email_service", "users")   # consumer adopts the current shape
 ```
 
-Consumer snapshots are stored under `schemas/consumers/<consumer>/<table>.json` and versioned the same way as source schemas.
+A projection is stored as one unversioned file at `schemas/consumers/<consumer>/<table>.json` (`columns`, `expected`, `subscribed_at`, `updated_at`).
 
 ---
 

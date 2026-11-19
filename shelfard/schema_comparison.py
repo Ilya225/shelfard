@@ -488,10 +488,10 @@ def _fmt_type(attrs: dict | None) -> str:
     return t
 
 
-def _explain(change: ColumnChange) -> str:
+def explain_change(change: ColumnChange) -> str:
     """One-line description of what the baseline update records for a change."""
-    n, new = change.column_name, change.new_value or {}
-    ct = change.change_type
+    n, new, old = change.column_name, change.new_value or {}, change.old_value or {}
+    ct = ChangeType(change.change_type)
     if ct == ChangeType.COLUMN_ADDED:
         return f"add '{n}' ({_type_name(new.get('col_type'))})"
     if ct == ChangeType.TYPE_RESOLVED:
@@ -505,6 +505,19 @@ def _explain(change: ColumnChange) -> str:
                 f"{(change.old_value or {}).get('physical_type')} to {new.get('physical_type')}")
     if ct == ChangeType.CONSTRAINT_CHANGED:
         return f"update constraints on '{n}': {', '.join(sorted(new))}"
+    if ct == ChangeType.COLUMN_REMOVED:
+        return f"remove '{n}'"
+    if ct == ChangeType.TYPE_CHANGED:
+        return f"change the type of '{n}' from {_fmt_type(old)} to {_fmt_type(new)}"
+    if ct == ChangeType.NULLABILITY_TIGHTENED:
+        return f"mark '{n}' as NOT NULL"
+    if ct == ChangeType.DEFAULT_CHANGED:
+        return f"change the default of '{n}' to {new.get('default_value')!r}"
+    if ct == ChangeType.COLUMN_REORDERED:
+        return f"record the new column order {new.get('order')}"
+    if ct in (ChangeType.PARTITION_CHANGED, ChangeType.CLUSTERING_CHANGED):
+        key = next(iter(new), "keys")
+        return f"set {key.replace('_', ' ')} to {new.get(key) or 'none'}"
     return f"{ct.value.replace('_', ' ')} on '{n}'"
 
 
@@ -520,7 +533,7 @@ def build_suggested_update(old_schema: TableSchema, new_schema: TableSchema,
     return {
         "action": "update_baseline",
         "based_on_version": old_schema.captured_at,
-        "explanation": [_explain(c) for c in changes],
+        "explanation": [explain_change(c) for c in changes],
         "schema": merged.to_dict(),
     }
 
@@ -577,12 +590,13 @@ def compare_schemas(old_schema: TableSchema, new_schema: TableSchema) -> ToolRes
             summary=summary,
         )
         if changes and overall == ChangeSeverity.SAFE:
-            diff.suggested_update = build_suggested_update(old_schema, new_schema, changes)
+            diff.suggested_update = {**build_suggested_update(old_schema, new_schema, changes),
+                                     "kind": "safe"}
 
         hint = {
             ChangeSeverity.SAFE:     ("All changes are safe. The diff's suggested_update holds the schema to "
                                       "register as the next baseline version (CLI: --update; MCP: "
-                                      "accept_safe_schema_update)."),
+                                      "accept_schema_update)."),
             ChangeSeverity.WARNING:  "Some changes need review. Inspect WARNING items before proceeding.",
             ChangeSeverity.BREAKING: "BREAKING changes detected. Do NOT auto-apply. Escalate or generate a migration plan.",
         }[overall]

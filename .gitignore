@@ -19,6 +19,7 @@ venv/
 
 # Schema registry data (runtime-generated)
 schemas/
+schemas.bak-*/
 
 # IDE
 .idea/

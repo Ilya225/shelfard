@@ -15,7 +15,7 @@ Usage (via CLI):
     shelfard agent --model ollama             # local Ollama, default model
     shelfard agent --model ollama:qwen2.5:7b  # specific Ollama model
     shelfard agent --model claude-opus-5-5    # specific model
-    shelfard agent --allow-writes             # also expose checker/var write tools
+    shelfard agent --allow-writes             # also expose probe/var write tools
 
 Write tools always require interactive approval (y/N) before they run.
 In the REPL, type /reset to start a fresh conversation.
@@ -53,11 +53,11 @@ DEFAULT_MODEL_ENV  = "SHELFARD_DEFAULT_MODEL"
 
 #: Tools that change registry state; each call needs explicit user approval.
 WRITE_TOOLS = (
-    "register_checker", "register_postgres_checker", "set_template_var", "delete_template_var",
-    "accept_safe_schema_update",
+    "register_probe", "register_postgres_probe", "set_template_var", "delete_template_var",
+    "accept_schema_update",
 )
 
-#: Env vars never forwarded to the MCP subprocess, even if a checker declares them.
+#: Env vars never forwarded to the MCP subprocess, even if a probe declares them.
 _NEVER_FORWARD = frozenset({
     "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "OPENAI_API_KEY", "OPENAI_ORG_ID",
     "OPENAI_PROJECT_ID",
@@ -73,20 +73,25 @@ _SUMMARY_KEEP_MESSAGES    = 20
 
 _READ_TOOLS_DOC = """\
 - get_schemas — list everything stored
-- get_schema(schema_name) — inspect a specific schema in detail (includes checker info)
+- get_schema(schema_name) — inspect a specific schema in detail (includes probe info)
 - get_subscriptions — list all consumer subscriptions
 - get_subscription(consumer_name, table_name) — inspect a specific subscription
-- get_checker_config(schema_name) — show a registered checker
-- live_check_schema(schema_name) — run a registered checker against the live source; when every
-  change is SAFE the result has a suggested_update — explain it and offer to apply it
+- get_probe_config(schema_name) — show a registered probe
+- live_check_schema(schema_name) — run a registered probe against the live source. Each change
+  carries consumer_impact (no_consumers / consumer_constrained, with each consumer's own severity)
+  and consumer_summary has "N of M consumers affected". suggested_update has kind "safe" (every
+  change SAFE) or "unaffected" (WARNING/BREAKING changes no consumer reads) — explain it and offer
+  to apply it
 - get_schema_odcs(schema_name, version?) — export a schema as an ODCS v3.1.0 data contract
 - list_template_vars / get_template_var(name) — inspect stored template variables"""
 
 _WRITE_TOOLS_DOC = """
-- register_checker(...) — register a NEW REST checker (public hosts, SHELFARD_* env vars only)
-- register_postgres_checker(...) — register a NEW PostgreSQL checker (table mode, public hosts)
+- register_probe(...) — register a NEW REST probe (public hosts, SHELFARD_* env vars only)
+- register_postgres_probe(...) — register a NEW PostgreSQL probe (table mode, public hosts)
 - set_template_var(name, value) / delete_template_var(name) — manage template variables
-- accept_safe_schema_update(schema_name) — save the suggested baseline after an all-SAFE check
+- accept_schema_update(schema_name, allow_unaffected=False) — save the suggested baseline after a
+  check. Without allow_unaffected only all-SAFE updates apply; allow_unaffected=True also accepts
+  WARNING/BREAKING changes that no consumer reads — only when the user explicitly agrees to that.
 Only call these write tools when the user explicitly asks for that change in this conversation.
 The user is asked to approve every write tool call before it runs."""
 
@@ -210,15 +215,15 @@ def _build_llm(model_id: str, provider: str):
 
 # ── MCP subprocess wiring ─────────────────────────────────────────────────────
 
-def _cli_checker_env_names() -> set[str]:
-    """Env var names declared by checkers registered from the CLI (trusted configs)."""
-    from .registry import get_all_checkers
-    result = get_all_checkers()
+def _cli_probe_env_names() -> set[str]:
+    """Env var names declared by probes registered from the CLI (trusted configs)."""
+    from .registry import get_all_probes
+    result = get_all_probes()
     if not result.success:
         return set()
     return {
         name
-        for c in result.data.get("checkers", [])
+        for c in result.data.get("probes", [])
         if c.get("registered_via", "cli") != "mcp"
         for name in c.get("env", [])
     }
@@ -228,13 +233,13 @@ def _mcp_server_env() -> dict[str, str]:
     """
     Environment passed to the MCP subprocess, on top of the MCP SDK's safe defaults
     (PATH, HOME, ...). Forwarded: SHELFARD_* vars, names in SHELFARD_MCP_ENV_ALLOWLIST,
-    and env vars declared by CLI-registered checkers (their URLs/DSNs cannot be changed
+    and env vars declared by CLI-registered probes (their URLs/DSNs cannot be changed
     through MCP). LLM provider API keys are never forwarded.
     """
     allowlist = {
         n.strip() for n in os.environ.get(MCP_ENV_ALLOWLIST_VAR, "").split(",") if n.strip()
     }
-    allowed = allowlist | _cli_checker_env_names()
+    allowed = allowlist | _cli_probe_env_names()
     return {
         k: v for k, v in os.environ.items()
         if k not in _NEVER_FORWARD and (k.startswith(MCP_ENV_PREFIX) or k in allowed)

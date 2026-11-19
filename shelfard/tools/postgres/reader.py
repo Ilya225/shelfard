@@ -106,7 +106,7 @@ class PostgresReader(SchemaReader):
 
     The ``dsn`` must be a fully-resolved connection string (no ``$VAR``
     placeholders).  Callers that need env-var substitution should use
-    :class:`~shelfard.tools.postgres.checker.PostgresChecker` instead.
+    :class:`~shelfard.tools.postgres.probe.PostgresProbe` instead.
     """
 
     def __init__(

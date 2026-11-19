@@ -1,21 +1,21 @@
 """
-Iceberg drift checker.
+Iceberg drift probe.
 
-Loads a stored :class:`~shelfard.models.IcebergCheckerConfig`, resolves
+Loads a stored :class:`~shelfard.models.IcebergProbeConfig`, resolves
 ``{{template_vars}}`` and then ``$ENV_VARS`` in the table path at run time,
 reads the table's current schema, and diffs it against the registered baseline.
 """
 
 import os
 
-from ..base import Checker
-from ...models import IcebergCheckerConfig, ToolResult
+from ..base import Probe
+from ...models import IcebergProbeConfig, ToolResult
 
 
-class IcebergChecker(Checker):
+class IcebergProbe(Probe):
     """Run a stored Iceberg drift-check configuration."""
 
-    def __init__(self, config: IcebergCheckerConfig, registry) -> None:
+    def __init__(self, config: IcebergProbeConfig, registry) -> None:
         self.config = config
         self.registry = registry
 
@@ -53,9 +53,10 @@ class IcebergChecker(Checker):
                 next_action_hint="Run 'shelfard iceberg snapshot' first to capture a baseline",
             )
 
-        from ...schema_comparison import compare_schemas_from_dicts
+        from ..base import compare_against_baseline
 
-        diff = compare_schemas_from_dicts(baseline.data["schema"], live.data["schema"])
+        diff = compare_against_baseline(self.registry, self.config.schema_name,
+                                        baseline.data["schema"], live.data["schema"])
         if not diff.success:
             return ToolResult(success=False, error=diff.error)
 

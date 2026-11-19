@@ -1,16 +1,15 @@
-"""RestChecker — runs a drift check against a live REST endpoint."""
+"""RestProbe — runs a drift check against a live REST endpoint."""
 
 import os
 
-from ...models import RestCheckerConfig, ToolResult
+from ...models import RestProbeConfig, ToolResult
 from .reader import RestEndpointReader
-from ...schema_comparison import compare_schemas_from_dicts
 from ...security import private_hosts_allowed
-from ..base import Checker
+from ..base import Probe, compare_against_baseline
 
 
-class RestChecker(Checker):
-    def __init__(self, config: RestCheckerConfig, registry) -> None:
+class RestProbe(Probe):
+    def __init__(self, config: RestProbeConfig, registry) -> None:
         self.config = config
         self.registry = registry  # SchemaRegistry instance
 
@@ -25,7 +24,7 @@ class RestChecker(Checker):
                 error=f"Missing required env vars: {', '.join(missing)}",
                 next_action_hint=(
                     "Export them before running. Inside 'shelfard agent', the agent forwards "
-                    "env vars declared by checkers registered from the CLI; LLM API keys are "
+                    "env vars declared by probes registered from the CLI; LLM API keys are "
                     "never forwarded."
                 ),
             )
@@ -44,7 +43,7 @@ class RestChecker(Checker):
             for k, v in entry.items():
                 resolved_headers[k] = _substitute(v, self.config.env)
 
-        # 3. Fetch current schema from the live endpoint. Checkers registered through MCP
+        # 3. Fetch current schema from the live endpoint. Probes registered through MCP
         #    are LLM-controlled: guard every connection (incl. redirects) against internal
         #    addresses on the connected socket, which also defeats DNS rebinding.
         guard = self.config.registered_via == "mcp" and not private_hosts_allowed()
@@ -74,8 +73,9 @@ class RestChecker(Checker):
             )
 
         # 5. Diff
-        diff_result = compare_schemas_from_dicts(
-            baseline_result.data["schema"], new_result.data["schema"]
+        diff_result = compare_against_baseline(
+            self.registry, self.config.schema_name,
+            baseline_result.data["schema"], new_result.data["schema"],
         )
         if not diff_result.success:
             return ToolResult(success=False, error=diff_result.error)

@@ -45,16 +45,16 @@ class GCSRegistry(SchemaRegistry):
     def get_all_consumers(self):
         raise NotImplementedError(_MSG)
 
-    def register_checker(self, schema_name, config):
+    def register_probe(self, schema_name, config):
         raise NotImplementedError(_MSG)
 
-    def get_checker(self, schema_name):
+    def get_probe(self, schema_name):
         raise NotImplementedError(_MSG)
 
-    def get_all_checkers(self):
+    def get_all_probes(self):
         raise NotImplementedError(_MSG)
 
-    def run_checker(self, schema_name):
+    def run_probe(self, schema_name):
         raise NotImplementedError(_MSG)
 
     def set_var(self, name, value):
@@ -69,5 +69,5 @@ class GCSRegistry(SchemaRegistry):
     def delete_var(self, name):
         raise NotImplementedError(_MSG)
 
-    def get_consumers_affected_by_diff(self, table_name, diff):
+    def unsubscribe_consumer(self, consumer_name, table_name):
         raise NotImplementedError(_MSG)

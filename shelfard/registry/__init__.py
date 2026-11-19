@@ -32,21 +32,24 @@ __all__ = [
     "get_consumer_subscription",
     "get_consumers_for_table",
     "get_all_consumers",
-    "get_consumers_affected_by_diff",
-    # checker shims
-    "register_checker",
-    "get_checker",
-    "get_all_checkers",
-    "run_checker",
+    "unsubscribe_consumer",
+    "refresh_consumer",
+    "assess_consumer_impact",
+    "compare_with_baseline",
+    # probe shims
+    "register_probe",
+    "get_probe",
+    "get_all_probes",
+    "run_probe",
     # template variable shims
     "set_var",
     "get_var",
     "list_vars",
     "delete_var",
     "resolve_template",
-    "accept_safe_update",
+    "accept_update",
     "get_schema_history",
-    "fetch_checker_schema",
+    "fetch_probe_schema",
 ]
 
 # ── Default instance ──────────────────────────────────────────────────────────
@@ -61,18 +64,21 @@ subscribe_consumer           = _default.subscribe_consumer
 get_consumer_subscription    = _default.get_consumer_subscription
 get_consumers_for_table      = _default.get_consumers_for_table
 get_all_consumers            = _default.get_all_consumers
-get_consumers_affected_by_diff = _default.get_consumers_affected_by_diff
+unsubscribe_consumer         = _default.unsubscribe_consumer
+refresh_consumer             = _default.refresh_consumer
+assess_consumer_impact       = _default.assess_consumer_impact
+compare_with_baseline        = _default.compare_with_baseline
 
-register_checker             = _default.register_checker
-get_checker                  = _default.get_checker
-get_all_checkers             = _default.get_all_checkers
-run_checker                  = _default.run_checker
+register_probe             = _default.register_probe
+get_probe                  = _default.get_probe
+get_all_probes             = _default.get_all_probes
+run_probe                  = _default.run_probe
 
 set_var                      = _default.set_var
 get_var                      = _default.get_var
 list_vars                    = _default.list_vars
 delete_var                   = _default.delete_var
 resolve_template             = _default.resolve_template
-accept_safe_update           = _default.accept_safe_update
+accept_update                = _default.accept_update
 get_schema_history           = _default.get_schema_history
-fetch_checker_schema         = _default.fetch_checker_schema
+fetch_probe_schema         = _default.fetch_probe_schema

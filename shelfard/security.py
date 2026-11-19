@@ -5,7 +5,7 @@ Security helpers shared by the registry, MCP server, and agent.
                             file path (schema, table, consumer names) against path traversal.
 - ``validate_var_name``  — enforces the documented ``{{var}}`` name format.
 - ``check_env_allowed``  — restricts which environment variables an LLM-registered
-                            checker may reference (prevents secret exfiltration).
+                            probe may reference (prevents secret exfiltration).
 - ``check_url_safe``     — rejects non-HTTP(S) URLs and hosts that resolve to private,
                             loopback, link-local, or otherwise internal addresses (SSRF).
 - ``check_host_safe``    — the same host check, for non-HTTP targets (PostgreSQL).
@@ -30,11 +30,11 @@ _NAME_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.\-]{0,127}$")
 _VAR_NAME_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
 _ENV_REF_RE = re.compile(r"\$([A-Z_][A-Z0-9_]*)")
 
-#: Env vars an LLM-registered checker may always reference.
+#: Env vars an LLM-registered probe may always reference.
 MCP_ENV_PREFIX = "SHELFARD_"
-#: Comma-separated extra env var names an LLM-registered checker may reference.
+#: Comma-separated extra env var names an LLM-registered probe may reference.
 MCP_ENV_ALLOWLIST_VAR = "SHELFARD_MCP_ENV_ALLOWLIST"
-#: Set to "1" to let LLM-registered checkers target private/loopback hosts.
+#: Set to "1" to let LLM-registered probes target private/loopback hosts.
 MCP_ALLOW_PRIVATE_HOSTS_VAR = "SHELFARD_MCP_ALLOW_PRIVATE_HOSTS"
 
 
@@ -75,7 +75,7 @@ def extract_env_refs(*templates: str) -> set[str]:
 
 def check_env_allowed(env_names: list[str]) -> Optional[str]:
     """
-    Return an error if any env var is not allowed for LLM-registered checkers.
+    Return an error if any env var is not allowed for LLM-registered probes.
 
     Allowed: names prefixed with ``SHELFARD_`` or listed in ``SHELFARD_MCP_ENV_ALLOWLIST``.
     """
@@ -88,9 +88,9 @@ def check_env_allowed(env_names: list[str]) -> Optional[str]:
     )
     if denied:
         return (
-            f"Env vars not allowed for checkers registered through MCP: {', '.join(denied)}. "
+            f"Env vars not allowed for probes registered through MCP: {', '.join(denied)}. "
             f"Use names prefixed with '{MCP_ENV_PREFIX}', add them to {MCP_ENV_ALLOWLIST_VAR}, "
-            f"or register the checker yourself with 'shelfard checker register'."
+            f"or register the probe yourself with 'shelfard probe register'."
         )
     return None
 
@@ -130,7 +130,7 @@ def resolve_public_ips(host: str, port: int) -> tuple[list[str], Optional[str]]:
     for ip in ips:
         if is_internal_ip(ip):
             return [], (
-                f"Host {host!r} resolves to internal address {ip}. Checkers registered "
+                f"Host {host!r} resolves to internal address {ip}. Probes registered "
                 f"through MCP may only target public hosts; set "
                 f"{MCP_ALLOW_PRIVATE_HOSTS_VAR}=1 to allow private/loopback hosts."
             )
@@ -221,7 +221,7 @@ def parse_pg_hosts(dsn: str) -> list[tuple[str, int, Optional[str]]]:
 
 def check_pg_dsn_safe(dsn: str) -> tuple[Optional[str], Optional[str]]:
     """
-    Validate a fully-resolved DSN for an MCP-registered checker.
+    Validate a fully-resolved DSN for an MCP-registered probe.
 
     Returns ``(error, pinned_ip)``. The DSN must name exactly one public host (multi-host
     and Unix-socket DSNs are rejected). ``pinned_ip`` is the validated address to pass as
@@ -233,7 +233,7 @@ def check_pg_dsn_safe(dsn: str) -> tuple[Optional[str], Optional[str]]:
     except ValueError as e:
         return f"Cannot parse DSN: {e}", None
     if len(hosts) != 1:
-        return "Multi-host DSNs are not allowed for checkers registered through MCP.", None
+        return "Multi-host DSNs are not allowed for probes registered through MCP.", None
     host, port, hostaddr = hosts[0]
     if "$" in host or "{{" in host:
         return "The DSN host must be resolved (no unresolved $VAR or {{var}}).", None

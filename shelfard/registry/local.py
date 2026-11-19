@@ -15,16 +15,16 @@ Each JSON file stores: {"table_name": "...", "versions": [...]}
 from __future__ import annotations
 
 import json
-import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
 from ..models import (
-    ColumnSchema, TableSchema, ConsumerSubscription, SchemaDiff, ToolResult,
-    RestCheckerConfig, PostgresCheckerConfig, FileCheckerConfig, IcebergCheckerConfig,
+    ColumnSchema, TableSchema, ConsumerProjection, ToolResult,
+    RestProbeConfig, PostgresProbeConfig, FileProbeConfig, IcebergProbeConfig,
 )
 from .base import SchemaRegistry
+from ..projection import missing_paths, project
 from ..security import ensure_within, query_template_error, validate_name, validate_var_name
 
 
@@ -207,10 +207,10 @@ class LocalFileRegistry(SchemaRegistry):
         columns: Optional[list[str]] = None,
     ) -> ToolResult:
         """
-        Register a consumer's dependency on a source schema.
+        Save (overwrite) a consumer's projection on a source schema.
 
-        columns=None  → full subscription (snapshot all columns).
-        columns=[...] → projection (only those columns are captured).
+        columns=None  → all top-level columns of the latest schema.
+        columns=[...] → the given paths (``email``, ``address.zip``, ``tags[]``).
         """
         if invalid := self._invalid_names(consumer_name=consumer_name, table_name=table_name):
             return invalid
@@ -222,154 +222,144 @@ class LocalFileRegistry(SchemaRegistry):
                       f"Register the source schema first.",
                 next_action_hint=f"Call register_schema('{table_name}', ...) to baseline the source.",
             )
-
-        source_version = source_result.data["version"]
-        source_schema_dict = source_result.data["schema"]
-        all_columns = [ColumnSchema.from_dict(c) for c in source_schema_dict["columns"]]
-
-        hint = None
-        if columns is not None:
-            col_map = {c.name: c for c in all_columns}
-            unknown = [c for c in columns if c not in col_map]
-            selected = [col_map[c] for c in columns if c in col_map]
-
-            if unknown:
-                hint = f"Unknown columns ignored: {unknown}. Available: {list(col_map.keys())}"
-            if not selected:
-                return ToolResult(
-                    success=False,
-                    error=f"None of the requested columns {columns} exist in '{table_name}'.",
-                )
-            snapshot_columns = selected
-        else:
-            snapshot_columns = all_columns
-
-        snapshot = TableSchema(
-            table_name=table_name,
-            columns=snapshot_columns,
-            partition_keys=source_schema_dict.get("partition_keys", []),
-            clustering_keys=source_schema_dict.get("clustering_keys", []),
-            source="consumer_subscription",
-            captured_at=None,
-        )
-
-        sub = ConsumerSubscription(
-            consumer_name=consumer_name,
-            source_table=table_name,
-            subscribed_columns=columns,
-            schema=snapshot,
-            subscribed_at=datetime.now(timezone.utc).isoformat(),
-            source_schema_version=source_version,
-        )
+        schema = TableSchema.from_dict(source_result.data["schema"])
+        full = columns is None
+        paths = [c.name for c in schema.columns] if full else list(dict.fromkeys(columns))
+        if not paths:
+            return ToolResult(success=False, error="No columns to subscribe to.")
+        missing = missing_paths(schema, paths)
+        if missing:
+            return ToolResult(
+                success=False,
+                error=f"Unknown column path(s) in '{table_name}': {missing}. "
+                      f"Top-level columns: {[c.name for c in schema.columns]}",
+            )
 
         path = self._consumer_path(consumer_name, table_name)
+        now = datetime.now(timezone.utc).isoformat()
+        projection = ConsumerProjection(
+            consumer_name=consumer_name,
+            source_table=table_name,
+            columns=paths,
+            expected=project(schema, paths).columns,
+            source=schema.source,
+            full=full,
+            subscribed_at=now,
+            updated_at=now,
+        )
         try:
-            if path.exists():
-                file_data = self._load_json(path)
-            else:
-                file_data = {"consumer_name": consumer_name, "source_table": table_name, "versions": []}
-
-            file_data["versions"].append(sub.to_dict())
-            self._save_json(path, file_data)
-
-            return ToolResult(
-                success=True,
-                data={
-                    "subscribed_at": sub.subscribed_at,
-                    "source_schema_version": source_version,
-                    "column_count": len(snapshot_columns),
-                    "subscribed_columns": columns,
-                },
-                next_action_hint=hint,
-            )
+            self._save_json(path, projection.to_dict())
         except Exception as e:
             return ToolResult(success=False, error=f"Failed to save subscription: {e}")
+        return ToolResult(
+            success=True,
+            data={"projection": projection.to_dict(), "column_count": len(paths)},
+        )
 
-    def get_consumer_subscription(self, consumer_name: str, table_name: str) -> ToolResult:
-        """Retrieve the latest subscription snapshot for a consumer/table pair."""
+    def _load_projection(self, path: Path) -> ConsumerProjection:
+        return ConsumerProjection.from_dict(upgrade_consumer_file(self._load_json(path)))
+
+    def unsubscribe_consumer(self, consumer_name: str, table_name: str) -> ToolResult:
         if invalid := self._invalid_names(consumer_name=consumer_name, table_name=table_name):
             return invalid
         path = self._consumer_path(consumer_name, table_name)
+        if not path.exists():
+            return ToolResult(success=False,
+                              error=f"No subscription found for consumer '{consumer_name}' on '{table_name}'.")
+        path.unlink()
+        try:
+            path.parent.rmdir()          # remove the consumer dir when it was the last table
+        except OSError:
+            pass
+        return ToolResult(success=True, data={"consumer": consumer_name, "table": table_name})
 
+    def refresh_consumer(self, consumer_name: str, table_name: str) -> ToolResult:
+        """Re-project the consumer's paths from the latest registered schema."""
+        current = self.get_consumer_subscription(consumer_name, table_name)
+        if not current.success:
+            return current
+        projection = ConsumerProjection.from_dict(current.data["subscription"])
+        latest = self.get_registered_schema(table_name)
+        if not latest.success:
+            return latest
+        schema = TableSchema.from_dict(latest.data["schema"])
+        missing = missing_paths(schema, projection.columns)
+        if missing:
+            return ToolResult(
+                success=False,
+                error=f"'{table_name}' no longer has {missing}; re-subscribe '{consumer_name}' "
+                      f"with the columns it reads now.",
+            )
+        before = projection.expected_schema()
+        projection.expected = project(schema, projection.columns).columns
+        projection.source = schema.source
+        projection.updated_at = datetime.now(timezone.utc).isoformat()
+        from ..schema_comparison import compare_schemas
+        changed = compare_schemas(before, projection.expected_schema()).data["diff"]["changes"]
+        try:
+            self._save_json(self._consumer_path(consumer_name, table_name), projection.to_dict())
+        except Exception as e:
+            return ToolResult(success=False, error=f"Failed to save subscription: {e}")
+        return ToolResult(success=True, data={"projection": projection.to_dict(),
+                                              "adopted_changes": changed})
+
+    def get_consumer_subscription(self, consumer_name: str, table_name: str) -> ToolResult:
+        """Retrieve a consumer's projection on a table."""
+        if invalid := self._invalid_names(consumer_name=consumer_name, table_name=table_name):
+            return invalid
+        path = self._consumer_path(consumer_name, table_name)
         if not path.exists():
             return ToolResult(
                 success=False,
                 error=f"No subscription found for consumer '{consumer_name}' on '{table_name}'.",
                 next_action_hint=f"Call subscribe_consumer('{consumer_name}', '{table_name}') to create one.",
             )
-
         try:
-            file_data = self._load_json(path)
-            entry = file_data["versions"][-1]
-            sub = ConsumerSubscription.from_dict(entry)
-            return ToolResult(
-                success=True,
-                data={"subscription": sub.to_dict()},
-            )
+            return ToolResult(success=True, data={"subscription": self._load_projection(path).to_dict()})
         except Exception as e:
             return ToolResult(success=False, error=f"Failed to read subscription: {e}")
 
     def get_consumers_for_table(self, table_name: str) -> ToolResult:
-        """List all consumers subscribed to a given source table."""
+        """All consumer projections on a source table."""
         if invalid := self._invalid_names(table_name=table_name):
             return invalid
-        consumers_dir = self._consumers_dir()
-        if not consumers_dir.exists():
-            return ToolResult(success=True, data={"consumers": []})
-
         consumers = []
-        for consumer_dir in sorted(consumers_dir.iterdir()):
-            if not consumer_dir.is_dir():
-                continue
-            sub_path = consumer_dir / f"{table_name}.json"
-            if not sub_path.exists():
-                continue
-            try:
-                file_data = self._load_json(sub_path)
-                latest = file_data["versions"][-1]
-                consumers.append({
-                    "consumer": consumer_dir.name,
-                    "subscribed_columns": latest.get("subscribed_columns"),
-                    "subscribed_at": latest.get("subscribed_at"),
-                    "source_schema_version": latest.get("source_schema_version"),
-                })
-            except Exception:
-                pass
-
-        return ToolResult(success=True, data={"consumers": consumers})
-
-    def get_all_consumers(self) -> ToolResult:
-        """List every consumer subscription across all tables."""
         consumers_dir = self._consumers_dir()
-        if not consumers_dir.exists():
-            return ToolResult(success=True, data={"consumers": []})
-
-        consumers = []
-        for consumer_dir in sorted(consumers_dir.iterdir()):
-            if not consumer_dir.is_dir():
-                continue
-            for sub_path in sorted(consumer_dir.glob("*.json")):
+        if consumers_dir.exists():
+            for consumer_dir in sorted(consumers_dir.iterdir()):
+                sub_path = consumer_dir / f"{table_name}.json"
+                if not consumer_dir.is_dir() or not sub_path.exists():
+                    continue
                 try:
-                    file_data = self._load_json(sub_path)
-                    latest = file_data["versions"][-1]
-                    consumers.append({
-                        "consumer": consumer_dir.name,
-                        "source_table": file_data.get("source_table", sub_path.stem),
-                        "subscribed_columns": latest.get("subscribed_columns"),
-                        "subscribed_at": latest.get("subscribed_at"),
-                    })
+                    consumers.append({"consumer": consumer_dir.name,
+                                      **self._load_projection(sub_path).to_dict()})
                 except Exception:
                     pass
+        return ToolResult(success=True, data={"consumers": consumers, "total": len(consumers)})
 
+    def get_all_consumers(self) -> ToolResult:
+        """Every consumer projection across all tables."""
+        consumers = []
+        consumers_dir = self._consumers_dir()
+        if consumers_dir.exists():
+            for consumer_dir in sorted(consumers_dir.iterdir()):
+                if not consumer_dir.is_dir():
+                    continue
+                for sub_path in sorted(consumer_dir.glob("*.json")):
+                    try:
+                        consumers.append({"consumer": consumer_dir.name,
+                                          **self._load_projection(sub_path).to_dict()})
+                    except Exception:
+                        pass
         return ToolResult(success=True, data={"consumers": consumers})
 
-    # ── Checkers ──────────────────────────────────────────────────────────────
+    # ── Probes ──────────────────────────────────────────────────────────────
 
-    def _checkers_dir(self) -> Path:
-        return self._root / "checkers"
+    def _probes_dir(self) -> Path:
+        return self._root / "probes"
 
-    def _checker_path(self, schema_name: str) -> Path:
-        return self._safe_path("checkers", f"{schema_name}.json")
+    def _probe_path(self, schema_name: str) -> Path:
+        return self._safe_path("probes", f"{schema_name}.json")
 
     def _vars_path(self) -> Path:
         return self._root / "vars.json"
@@ -381,12 +371,12 @@ class LocalFileRegistry(SchemaRegistry):
     def _save_vars(self, data: dict) -> None:
         self._save_json(self._vars_path(), data)
 
-    def register_checker(
+    def register_probe(
         self,
         schema_name: str,
-        config: RestCheckerConfig | PostgresCheckerConfig | FileCheckerConfig | IcebergCheckerConfig,
+        config: RestProbeConfig | PostgresProbeConfig | FileProbeConfig | IcebergProbeConfig,
     ) -> ToolResult:
-        """Store a checker config. Always overwrites — checkers are not versioned."""
+        """Store a probe config. Always overwrites — probes are not versioned."""
         if invalid := self._invalid_names(schema_name=schema_name):
             return invalid
         if config.schema_name != schema_name:
@@ -397,7 +387,7 @@ class LocalFileRegistry(SchemaRegistry):
         if err := query_template_error(getattr(config, "query", None)):
             return ToolResult(success=False, error=err)
         config.registered_at = datetime.now(timezone.utc).isoformat()
-        path = self._checker_path(schema_name)
+        path = self._probe_path(schema_name)
         try:
             self._save_json(path, config.to_dict())
             return ToolResult(
@@ -405,79 +395,79 @@ class LocalFileRegistry(SchemaRegistry):
                 data={"schema_name": schema_name, "registered_at": config.registered_at},
             )
         except Exception as e:
-            return ToolResult(success=False, error=f"Failed to register checker: {e}")
+            return ToolResult(success=False, error=f"Failed to register probe: {e}")
 
-    def get_checker(self, schema_name: str) -> ToolResult:
-        """Retrieve the checker config for the given schema."""
+    def get_probe(self, schema_name: str) -> ToolResult:
+        """Retrieve the probe config for the given schema."""
         if invalid := self._invalid_names(schema_name=schema_name):
             return invalid
-        path = self._checker_path(schema_name)
+        path = self._probe_path(schema_name)
         if not path.exists():
             return ToolResult(
                 success=False,
-                error=f"No checker registered for '{schema_name}'.",
+                error=f"No probe registered for '{schema_name}'.",
             )
         try:
-            raw = self._load_json(path)
-            return ToolResult(success=True, data={"checker": raw})
+            raw = _legacy_probe(self._load_json(path))
+            return ToolResult(success=True, data={"probe": raw})
         except Exception as e:
-            return ToolResult(success=False, error=f"Failed to read checker: {e}")
+            return ToolResult(success=False, error=f"Failed to read probe: {e}")
 
-    def get_all_checkers(self) -> ToolResult:
-        """List all registered checkers with summary metadata."""
-        checkers_dir = self._checkers_dir()
-        if not checkers_dir.exists():
-            return ToolResult(success=True, data={"checkers": []})
+    def get_all_probes(self) -> ToolResult:
+        """List all registered probes with summary metadata."""
+        probes_dir = self._probes_dir()
+        if not probes_dir.exists():
+            return ToolResult(success=True, data={"probes": []})
         result = []
-        for f in sorted(checkers_dir.glob("*.json")):
+        for f in sorted(probes_dir.glob("*.json")):
             try:
-                c = self._load_json(f)
+                c = _legacy_probe(self._load_json(f))
                 result.append({
                     "schema_name": c["schema_name"],
-                    "checker_type": c.get("checker_type", "rest"),
-                    "url": c.get("url", ""),       # rest checkers
-                    "dsn": c.get("dsn", ""),       # postgres checkers
-                    "path": c.get("path", ""),     # file / iceberg checkers
+                    "probe_type": c.get("probe_type", "rest"),
+                    "url": c.get("url", ""),       # rest probes
+                    "dsn": c.get("dsn", ""),       # postgres probes
+                    "path": c.get("path", ""),     # file / iceberg probes
                     "env": c.get("env", []),
                     "registered_at": c.get("registered_at"),
                     "registered_via": c.get("registered_via", "cli"),
                 })
             except Exception:
                 pass
-        return ToolResult(success=True, data={"checkers": result})
+        return ToolResult(success=True, data={"probes": result})
 
-    def _build_checker(self, schema_name: str):
-        """Return (checker, None) for a stored config, or (None, error ToolResult)."""
-        result = self.get_checker(schema_name)
+    def _build_probe(self, schema_name: str):
+        """Return (probe, None) for a stored config, or (None, error ToolResult)."""
+        result = self.get_probe(schema_name)
         if not result.success:
             return None, result
 
-        config_dict = result.data["checker"]
-        checker_type = config_dict.get("checker_type", "rest")
+        config_dict = result.data["probe"]
+        probe_type = config_dict.get("probe_type", "rest")
 
-        if checker_type == "rest":
-            from ..tools.rest import RestChecker
-            return RestChecker(RestCheckerConfig.from_dict(config_dict), self), None
-        if checker_type == "postgres":
-            from ..tools.postgres import PostgresChecker
-            return PostgresChecker(PostgresCheckerConfig.from_dict(config_dict), self), None
-        if checker_type == "file":
-            from ..tools.files import FileChecker
-            return FileChecker(FileCheckerConfig.from_dict(config_dict), self), None
-        if checker_type == "iceberg":
-            from ..tools.iceberg import IcebergChecker
-            return IcebergChecker(IcebergCheckerConfig.from_dict(config_dict), self), None
-        return None, ToolResult(success=False, error=f"Unknown checker type: {checker_type!r}")
+        if probe_type == "rest":
+            from ..tools.rest import RestProbe
+            return RestProbe(RestProbeConfig.from_dict(config_dict), self), None
+        if probe_type == "postgres":
+            from ..tools.postgres import PostgresProbe
+            return PostgresProbe(PostgresProbeConfig.from_dict(config_dict), self), None
+        if probe_type == "file":
+            from ..tools.files import FileProbe
+            return FileProbe(FileProbeConfig.from_dict(config_dict), self), None
+        if probe_type == "iceberg":
+            from ..tools.iceberg import IcebergProbe
+            return IcebergProbe(IcebergProbeConfig.from_dict(config_dict), self), None
+        return None, ToolResult(success=False, error=f"Unknown probe type: {probe_type!r}")
 
-    def run_checker(self, schema_name: str) -> ToolResult:
-        """Load the checker config and run the live drift check."""
-        checker, error = self._build_checker(schema_name)
-        return error if error else checker.run()
+    def run_probe(self, schema_name: str) -> ToolResult:
+        """Load the probe config and run the live drift check."""
+        probe, error = self._build_probe(schema_name)
+        return error if error else probe.run()
 
-    def fetch_checker_schema(self, schema_name: str) -> ToolResult:
-        """Run only the fetch half of a stored checker: the live schema, no diff."""
-        checker, error = self._build_checker(schema_name)
-        return error if error else checker.fetch()
+    def fetch_probe_schema(self, schema_name: str) -> ToolResult:
+        """Run only the fetch half of a stored probe: the live schema, no diff."""
+        probe, error = self._build_probe(schema_name)
+        return error if error else probe.fetch()
 
     # ── Template variables ────────────────────────────────────────────────────
 
@@ -492,7 +482,7 @@ class LocalFileRegistry(SchemaRegistry):
             return ToolResult(
                 success=True,
                 data={"name": name, "value": value},
-                next_action_hint=f"Use {{{{{{name}}}}}} in checker configs or snapshot URLs.",
+                next_action_hint=f"Use {{{{{{name}}}}}} in probe configs or snapshot URLs.",
             )
         except Exception as e:
             return ToolResult(success=False, error=f"Failed to set var '{name}': {e}")
@@ -536,51 +526,31 @@ class LocalFileRegistry(SchemaRegistry):
 
     # ── Impact analysis ───────────────────────────────────────────────────────
 
-    def get_consumers_affected_by_diff(self, table_name: str, diff: SchemaDiff) -> ToolResult:
-        """
-        Given a SchemaDiff on a source table, return which consumers are impacted.
 
-        A consumer with a full subscription is affected by any change.
-        A consumer with a projection is affected only if one of their columns changed.
-        Column names from nested STRUCTs use dot-notation (e.g. "address.zip");
-        the top-level name ("address") is checked against the subscription.
-        """
-        consumers_result = self.get_consumers_for_table(table_name)
-        if not consumers_result.success:
-            return consumers_result
+def _legacy_probe(config: dict) -> dict:
+    """Probe configs saved before the checker → probe rename used ``checker_type``."""
+    if "probe_type" not in config and "checker_type" in config:
+        config = {**config, "probe_type": config["checker_type"]}
+        config.pop("checker_type")
+    return config
 
-        if not diff.has_changes:
-            return ToolResult(success=True, data={"affected": []})
 
-        # Collect top-level changed column names (strip nested qualifiers)
-        def _top(name: str) -> str:
-            return re.split(r"[.\[]", name, maxsplit=1)[0]
-
-        affected = []
-        for entry in consumers_result.data["consumers"]:
-            subscribed = entry["subscribed_columns"]
-            if subscribed is None:
-                # Full subscription — any change is impactful
-                impacted = [c.to_dict() for c in diff.changes]
-            else:
-                subscribed_set = set(subscribed)
-                impacted = [
-                    c.to_dict() for c in diff.changes
-                    if _top(c.column_name) in subscribed_set
-                ]
-
-            if impacted:
-                affected.append({
-                    "consumer": entry["consumer"],
-                    "subscribed_columns": subscribed,
-                    "impacted_changes": impacted,
-                })
-
-        return ToolResult(
-            success=True,
-            data={"affected": affected},
-            next_action_hint=(
-                f"{len(affected)} consumer(s) affected by changes to '{table_name}'."
-                if affected else None
-            ),
-        )
+def upgrade_consumer_file(data: dict) -> dict:
+    """Convert a pre-projection subscription file (a ``versions`` list of
+    snapshots) to a ConsumerProjection dict, using its latest entry."""
+    if "versions" not in data:
+        return data
+    latest = data["versions"][-1]
+    snapshot = latest.get("schema") or {}
+    columns = snapshot.get("columns") or []
+    subscribed = latest.get("subscribed_columns")
+    return {
+        "consumer_name": latest.get("consumer_name", data.get("consumer_name")),
+        "source_table": latest.get("source_table", data.get("source_table")),
+        "columns": list(subscribed) if subscribed else [c["name"] for c in columns],
+        "expected": columns,
+        "source": "unknown",
+        "full": subscribed is None,
+        "subscribed_at": latest.get("subscribed_at"),
+        "updated_at": latest.get("subscribed_at"),
+    }

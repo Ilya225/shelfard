@@ -560,27 +560,27 @@ test("foreign contract: only stated facts compared; --update keeps their physica
      test_check_foreign_contract, (HAVE_YAML, "pyyaml"))
 
 
-def test_check_with_checker(tmp):
-    from shelfard import FileCheckerConfig, registry
+def test_check_with_probe(tmp):
+    from shelfard import FileProbeConfig, registry
     avsc = {"type": "record", "name": "R", "fields": [{"name": "id", "type": "long"}]}
     path = _write(tmp / "r.avsc", json.dumps(avsc))
     with registry_tmp(tmp):
-        registry.register_checker("r", FileCheckerConfig(schema_name="r", path=str(path)))
-        live = registry.fetch_checker_schema("r")
+        registry.register_probe("r", FileProbeConfig(schema_name="r", path=str(path)))
+        live = registry.fetch_probe_schema("r")
         assert live.success and live.data["schema"]["columns"][0]["physical_type"] == "long", live
         contract = tmp / "r.json"
         odcs.save_contract(odcs.to_odcs([TableSchema.from_dict(live.data["schema"])]), contract)
-        code, out = run_cli("odcs", "check", str(contract), "--checker", "r")
+        code, out = run_cli("odcs", "check", str(contract), "--probe", "r")
         assert code == 0 and "No drift" in out, out
         avsc["fields"].append({"name": "extra", "type": ["null", "string"], "default": None})
         path.write_text(json.dumps(avsc))
-        code, out = run_cli("odcs", "check", str(contract), "--checker", "r")
+        code, out = run_cli("odcs", "check", str(contract), "--probe", "r")
         assert code == 1 and "column_added" in out, out
-        code, out = run_cli("odcs", "check", str(contract), "--checker", "missing")
+        code, out = run_cli("odcs", "check", str(contract), "--probe", "missing")
         assert code == 2, out
 
 
-test("odcs check --checker reads the live schema through a stored checker", test_check_with_checker)
+test("odcs check --probe reads the live schema through a stored probe", test_check_with_probe)
 
 
 def test_check_object_selection(tmp):

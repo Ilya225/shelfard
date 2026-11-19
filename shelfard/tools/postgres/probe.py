@@ -1,7 +1,7 @@
 """
-PostgreSQL drift checker.
+PostgreSQL drift probe.
 
-Loads a stored :class:`~shelfard.models.PostgresCheckerConfig`, resolves
+Loads a stored :class:`~shelfard.models.PostgresProbeConfig`, resolves
 ``$VAR`` placeholders in the DSN and query at run time (never at storage time),
 fetches the live schema via :class:`~shelfard.tools.postgres.reader.PostgresReader`,
 diffs it against the registered baseline, and returns a :class:`ToolResult`.
@@ -9,17 +9,17 @@ diffs it against the registered baseline, and returns a :class:`ToolResult`.
 
 import os
 
-from ..base import Checker
-from ...models import PostgresCheckerConfig, ToolResult
+from ..base import Probe
+from ...models import PostgresProbeConfig, ToolResult
 from ...security import (
     check_pg_dsn_safe, pin_pg_dsn, private_hosts_allowed, query_template_error,
 )
 
 
-class PostgresChecker(Checker):
+class PostgresProbe(Probe):
     """Run a stored PostgreSQL drift-check configuration."""
 
-    def __init__(self, config: PostgresCheckerConfig, registry) -> None:
+    def __init__(self, config: PostgresProbeConfig, registry) -> None:
         self.config = config
         self.registry = registry
 
@@ -34,7 +34,7 @@ class PostgresChecker(Checker):
                 error=f"Missing required environment variables: {', '.join(missing)}",
                 next_action_hint=(
                     "Export them before running. Inside 'shelfard agent', the agent forwards "
-                    "env vars declared by checkers registered from the CLI; LLM API keys are "
+                    "env vars declared by probes registered from the CLI; LLM API keys are "
                     "never forwarded."
                 ),
             )
@@ -55,7 +55,7 @@ class PostgresChecker(Checker):
             else None
         )
 
-        # 2.5 — Checkers registered through MCP: the resolved DSN must target exactly one
+        # 2.5 — Probes registered through MCP: the resolved DSN must target exactly one
         #       public host; pin the connection to the validated IP via hostaddr so libpq
         #       cannot resolve the name again (DNS-rebinding guard).
         if self.config.registered_via == "mcp" and not private_hosts_allowed():
@@ -101,9 +101,10 @@ class PostgresChecker(Checker):
             )
 
         # 5. Diff
-        from ...schema_comparison import compare_schemas_from_dicts
+        from ..base import compare_against_baseline
 
-        diff_result = compare_schemas_from_dicts(
+        diff_result = compare_against_baseline(
+            self.registry, self.config.schema_name,
             baseline_result.data["schema"],
             live_result.data["schema"],
         )
