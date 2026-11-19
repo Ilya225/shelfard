@@ -46,6 +46,17 @@ Python 3.12+ required.
 conda activate shelfard
 ```
 
+---
+
+## Use cases
+
+Short, end-to-end scenarios live in [`docs/use-cases/`](docs/use-cases/README.md):
+
+- [REST API: catch a breaking change in a third-party API](docs/use-cases/rest-api.md)
+- [PostgreSQL: gate migrations in CI](docs/use-cases/postgres.md)
+- [Files: watch a data lake output between pipeline runs](docs/use-cases/files.md)
+
+---
 
 ## CLI — REST endpoint drift detection
 
